@@ -60,7 +60,12 @@ const produced = (
 const fileReview = (
   path: string,
   diffs: readonly ProducedFileDiff[] = [],
-): ProducedFileReview => ({ path, diffs })
+  sources?: readonly string[],
+): ProducedFileReview => ({
+  path,
+  diffs,
+  ...(sources === undefined ? {} : { sources }),
+})
 
 const reviews = (paths: readonly string[]): readonly ProducedFileReview[] => paths.map((path, index) =>
   fileReview(path, index === 0
@@ -104,7 +109,7 @@ function call(
   return at(
     seq,
     'tool/call',
-    { turn, step: 1, callId, name: 'fixture', arguments: '{}' },
+    { turn, step: 1, callId, name: 'fixture', argsRaw: '{}' },
     { for: 'call', view: view ?? { card: 'generic', title: 'fixture' } },
   )
 }
@@ -226,9 +231,9 @@ describe('produced-file Turn data', () => {
       'out/index.html', 'out/app.css', 'notes.md',
     ])
     expect(reviewsForClosing(value)).toEqual([
-      fileReview('out/index.html', [{ path: 'out/index.html', oldText: 'old html', newText: 'new html' }]),
-      fileReview('out/app.css', [{ path: 'out/app.css', oldText: 'old css', newText: 'new css' }]),
-      fileReview('notes.md'),
+      fileReview('out/index.html', [{ path: 'out/index.html', oldText: 'old html', newText: 'new html' }], ['fixture']),
+      fileReview('out/app.css', [{ path: 'out/app.css', oldText: 'old css', newText: 'new css' }], ['fixture']),
+      fileReview('notes.md', [], ['fixture']),
     ])
   })
 
@@ -249,16 +254,96 @@ describe('produced-file Turn data', () => {
       fileReview('same.txt', [
         { path: 'same.txt', oldText: null, newText: 'x' },
         { path: 'same.txt', oldText: 'middle', newText: 'after', oldStart: 12, newStart: 12 },
-      ]),
-      fileReview('broken.txt'),
+      ], ['fixture']),
+      // The malformed result view falls back to the call view's hunks.
+      fileReview('broken.txt', [{ path: 'broken.txt', oldText: null, newText: 'x' }], ['fixture']),
     ])
+  })
+
+  it('reconstructs insert diffs from str_replace_editor call arguments', () => {
+    const insertCall = at(2, 'tool/call', {
+      turn: 1, step: 1, callId: 'ins', name: 'str_replace_editor',
+      argsRaw: JSON.stringify({
+        command: 'insert', path: 'src/app.ts', insert_line: 3, new_str: 'const x = 1;\n',
+      }),
+    }, {
+      for: 'call',
+      view: {
+        card: 'generic', title: 'insert src/app.ts', kind: 'edit',
+        locations: [{ path: 'src/app.ts' }],
+      },
+    })
+    const value = fold([
+      at(1, 'turn/start', { turn: 1 }),
+      insertCall,
+      result(3, 'ins'),
+    ])
+
+    expect(producedForClosing(value)).toEqual(['src/app.ts'])
+    expect(reviewsForClosing(value)).toEqual([
+      fileReview('src/app.ts', [{
+        path: 'src/app.ts', oldText: '', newText: 'const x = 1;\n', oldStart: 4, newStart: 4,
+      }], ['insert']),
+    ])
+  })
+
+  it('labels produced files with the tool commands that touched them', () => {
+    const createCall = at(2, 'tool/call', {
+      turn: 1, step: 1, callId: 'create', name: 'str_replace_editor',
+      argsRaw: JSON.stringify({ command: 'create', path: 'src/app.ts', file_text: 'a\n' }),
+    }, { for: 'call', view: diff('src/app.ts') })
+    const insertCall = at(3, 'tool/call', {
+      turn: 1, step: 1, callId: 'ins', name: 'str_replace_editor',
+      argsRaw: JSON.stringify({ command: 'insert', path: 'src/app.ts', insert_line: 1, new_str: 'x\n' }),
+    }, {
+      for: 'call',
+      view: { card: 'generic', title: 'insert src/app.ts', kind: 'edit', locations: [{ path: 'src/app.ts' }] },
+    })
+    const value = fold([
+      at(1, 'turn/start', { turn: 1 }),
+      createCall,
+      result(4, 'create'),
+      insertCall,
+      result(5, 'ins'),
+    ])
+    const reviews = reviewsForClosing(value)
+    expect(reviews).toHaveLength(1)
+    expect(reviews[0]?.sources).toEqual(['create', 'insert'])
+  })
+
+  it('ignores non-insert str_replace_editor calls and malformed insert arguments', () => {
+    const viewCall = at(2, 'tool/call', {
+      turn: 1, step: 1, callId: 'view', name: 'str_replace_editor',
+      argsRaw: JSON.stringify({ command: 'view', path: 'src/app.ts' }),
+    }, {
+      for: 'call',
+      view: { card: 'generic', title: 'view src/app.ts', kind: 'read', locations: [{ path: 'src/app.ts' }] },
+    })
+    const malformed = at(3, 'tool/call', {
+      turn: 1, step: 1, callId: 'bad', name: 'str_replace_editor',
+      argsRaw: '{not json',
+    }, {
+      for: 'call',
+      view: { card: 'generic', title: 'insert src/app.ts', kind: 'edit', locations: [{ path: 'src/app.ts' }] },
+    })
+    const value = fold([
+      at(1, 'turn/start', { turn: 1 }),
+      viewCall,
+      result(4, 'view'),
+      malformed,
+      result(5, 'bad'),
+    ])
+    // A `view` reads nothing; a malformed `insert` still lists its path but
+    // carries no reconstructable hunk.
+    expect(producedForClosing(value)).toEqual(['src/app.ts'])
+    expect(reviewsForClosing(value)).toEqual([fileReview('src/app.ts')])
   })
 
   it('ignores calls without mutation locations, orphan results, and replacement results', () => {
     const replacement = result(8, 'replacement')
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      at(2, 'tool/call', { turn: 1, step: 1, callId: 'no-view', name: 'fixture', arguments: '{}' }),
+      at(2, 'tool/call', { turn: 1, step: 1, callId: 'no-view', name: 'fixture', argsRaw: '{}' }),
       result(3, 'no-view'),
       call(4, 'locationless-edit', { card: 'generic', title: 'Edit', kind: 'edit' }),
       result(5, 'locationless-edit'),
@@ -327,17 +412,38 @@ describe('ProducedFiles review card', () => {
       .toContain('styles/b.css\n+ one\n+ two')
   })
 
+  it('shows the tool source badges on file rows and in the drawer header', () => {
+    const withSource = fileReview(
+      'src/app.ts',
+      [{ path: 'src/app.ts', oldText: 'a', newText: 'b' }],
+      ['insert'],
+    )
+    const view = render(<ProducedFiles matched={[withSource]} openFile={() => {}} t={t} />)
+    const card = view.getByRole('region', { name: 'Edited files' })
+    expect(within(card).getByText('insert')).toBeTruthy()
+    expect(within(card).getByLabelText('Changed by: insert')).toBeTruthy()
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Review src/app.ts' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+    // One badge on the row, one on the drawer file header.
+    expect(within(drawer).getAllByText('insert')).toHaveLength(1)
+    expect(within(card).getAllByText('insert')).toHaveLength(1)
+  })
+
   it('renders aggregate and per-file totals with a six-file preview', () => {
     const paths = ['deep/a.html', 'b.css', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts']
     const view = render(<ProducedFiles matched={reviews(paths)} openFile={() => {}} t={t} />)
     const card = view.getByRole('region', { name: 'Edited files' })
     expect(within(card).getByText('Edited 7 files')).toBeTruthy()
-    expect(within(card).getByText('1 more file')).toBeTruthy()
-    expect(within(card).getAllByRole('button')).toHaveLength(8)
+    expect(within(card).getByRole('button', { name: '1 more file' })).toBeTruthy()
+    // Header batch approve + batch undo, per shown row an open button plus
+    // its approve and undo buttons, and the expandable "more files" row.
+    expect(within(card).getAllByRole('button')).toHaveLength(21)
     expect(within(card).queryByRole('button', { name: 'Review g.ts' })).toBeNull()
     const first = within(card).getByRole('button', { name: 'Review deep/a.html' })
     expect(first.textContent).toContain('a.html')
-    expect(first.getAttribute('title')).toBe('deep/a.html')
+    // The full path rides the row container's tooltip.
+    expect(first.closest('div')?.getAttribute('title')).toBe('deep/a.html')
   })
 
   it('renders the active Web UI language after the locale changes', () => {
@@ -349,7 +455,8 @@ describe('ProducedFiles review card', () => {
     )
 
     expect(view.getByRole('region', { name: 'Edited files' })).toBeTruthy()
-    expect(view.getByRole('button', { name: 'Review all produced files' })).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Approve all' })).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Undo all' })).toBeTruthy()
 
     active = zh
     view.rerender(<ProducedFiles matched={changedReviews} openFile={() => {}} t={translate} />)
@@ -357,27 +464,27 @@ describe('ProducedFiles review card', () => {
     const card = view.getByRole('region', { name: '已编辑文件' })
     expect(within(card).getByText('已编辑 2 个文件')).toBeTruthy()
     expect(within(card).getByLabelText('新增 3 行，删除 1 行')).toBeTruthy()
-    fireEvent.click(within(card).getByRole('button', { name: '审查所有产出文件' }))
+    expect(within(card).getByRole('button', { name: '批量同意' })).toBeTruthy()
+    expect(within(card).getByRole('button', { name: '批量撤销' })).toBeTruthy()
+    expect(within(card).getByRole('button', { name: '同意 deep/a.html' })).toBeTruthy()
+    expect(within(card).getByRole('button', { name: '撤销 deep/a.html' })).toBeTruthy()
+    fireEvent.click(within(card).getByRole('button', { name: '审查 deep/a.html' }))
 
     const drawer = view.getByRole('dialog', { name: '审查' })
-    expect(within(drawer).getByText('2 个文件')).toBeTruthy()
+    expect(within(drawer).getByText('1 个文件')).toBeTruthy()
     expect(within(drawer).getByRole('button', { name: '复制差异' })).toBeTruthy()
     expect(within(drawer).getByRole('button', { name: '关闭' })).toBeTruthy()
     expect(within(drawer).getByRole('separator', { name: '调整审查面板大小' })).toBeTruthy()
-    expect(within(drawer).getAllByRole('button', { name: '在编辑器中打开' })).toHaveLength(2)
+    expect(within(drawer).getAllByRole('button', { name: '在编辑器中打开' })).toHaveLength(1)
   })
 
-  it('switches to reapply only after every reversible file is undone', async () => {
+  it('disables the row undo once the file is undone and reports the restored state', async () => {
     const inspectChanges = vi.fn(async () => ({ files: [
       { path: 'deep/a.html', state: 'applied' as const, changed: false },
     ] }))
-    const applyChanges = vi.fn()
-      .mockResolvedValueOnce({ files: [
-        { path: 'deep/a.html', state: 'undone', changed: true },
-      ] })
-      .mockResolvedValueOnce({ files: [
-        { path: 'deep/a.html', state: 'applied', changed: true },
-      ] })
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.html', state: 'undone' as const, changed: true },
+    ] }))
     const view = render(
       <ProducedFiles
         matched={[changedReviews[0]!]}
@@ -389,22 +496,28 @@ describe('ProducedFiles review card', () => {
     )
 
     await vi.waitFor(() => {
-      expect((view.getByRole('button', { name: 'Undo' }) as HTMLButtonElement).disabled).toBe(false)
+      expect((view.getByRole('button', { name: 'Undo deep/a.html' }) as HTMLButtonElement).disabled)
+        .toBe(false)
     })
     const timeout = vi.spyOn(window, 'setTimeout')
-    fireEvent.click(view.getByRole('button', { name: 'Undo' }))
-    await vi.waitFor(() => { expect(view.getByRole('button', { name: 'Reapply' })).toBeTruthy() })
-    expect(view.getByRole('alert').textContent).toContain('Changes undone')
+    fireEvent.click(view.getByRole('button', { name: 'Undo deep/a.html' }))
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('File restored')
+    })
     expect(timeout.mock.calls.some(([, delay]) => delay === 2000)).toBe(true)
     expect(applyChanges.mock.calls[0]?.[0].action).toBe('undo')
-
-    fireEvent.click(view.getByRole('button', { name: 'Reapply' }))
-    await vi.waitFor(() => { expect(view.getByRole('button', { name: 'Undo' })).toBeTruthy() })
-    expect(view.getByRole('alert').textContent).toContain('Changes reapplied')
-    expect(applyChanges.mock.calls[1]?.[0].action).toBe('redo')
+    expect(applyChanges.mock.calls[0]?.[0].files).toEqual([
+      { path: 'deep/a.html', diffs: changedReviews[0]?.diffs },
+    ])
+    // No redo: an undone file's undo is disabled and explained.
+    await vi.waitFor(() => {
+      const button = view.getByRole('button', { name: 'Undo deep/a.html' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(button.title).toBe('This file is already restored')
+    })
   })
 
-  it('keeps Undo in a mixed state and disables it when no file is reversible', async () => {
+  it('reports a partial batch undo and disables Undo all when nothing is left', async () => {
     const twoReversible = [
       fileReview('deep/a.txt', [{ path: 'deep/a.txt', oldText: 'a', newText: 'A' }]),
       fileReview('nested/b.txt', [{ path: 'nested/b.txt', oldText: 'b', newText: 'B' }]),
@@ -428,13 +541,15 @@ describe('ProducedFiles review card', () => {
       />,
     )
     await vi.waitFor(() => {
-      expect((view.getByRole('button', { name: 'Undo' }) as HTMLButtonElement).disabled).toBe(false)
+      expect((view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement).disabled)
+        .toBe(false)
     })
     const timeout = vi.spyOn(window, 'setTimeout')
-    fireEvent.click(view.getByRole('button', { name: 'Undo' }))
+    fireEvent.click(view.getByRole('button', { name: 'Undo all' }))
     await vi.waitFor(() => { expect(view.getByRole('alert')).toBeTruthy() })
     expect(applyChanges).toHaveBeenCalledOnce()
-    expect(view.getByRole('button', { name: 'Undo' })).toBeTruthy()
+    expect(applyChanges.mock.calls[0]?.[0].action).toBe('undo')
+    expect(applyChanges.mock.calls[0]?.[0].files).toHaveLength(2)
     const notice = view.getByRole('alert')
     expect(notice.textContent).toContain('Not all changes were restored')
     expect(notice.textContent).toContain('An error occurred while restoring some files')
@@ -448,35 +563,463 @@ describe('ProducedFiles review card', () => {
     expect(autoClose).toBeTypeOf('function')
     act(() => { if (typeof autoClose === 'function') autoClose() })
     expect(view.queryByRole('alert')).toBeNull()
-    fireEvent.click(view.getByRole('button', { name: 'Undo' }))
-    await vi.waitFor(() => { expect(applyChanges).toHaveBeenCalledTimes(2) })
+    // a.txt is undone and b.txt is conflicted, so nothing is undoable left.
+    await vi.waitFor(() => {
+      const button = view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(button.title).toBe('No safely reversible files are available in this change')
+    })
 
     view.rerender(
       <ProducedFiles matched={[fileReview('notes.md')]} openFile={() => {}} t={t} />,
     )
     await vi.waitFor(() => {
-      const button = view.getByRole('button', { name: 'Undo' }) as HTMLButtonElement
+      const button = view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement
       expect(button.disabled).toBe(true)
       expect(button.title).toBe('No safely reversible files are available in this change')
     })
   })
 
-  it('reviews every file from the header and copies the visible unified diff', async () => {
+  it('undoes a single file from its row, leaving other rows and the batch action alone', async () => {
+    const twoReversible = [
+      fileReview('deep/a.txt', [{ path: 'deep/a.txt', oldText: 'a', newText: 'A' }]),
+      fileReview('nested/b.txt', [{ path: 'nested/b.txt', oldText: 'b', newText: 'B' }]),
+    ]
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'applied' as const, changed: false },
+      { path: 'nested/b.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'undone' as const, changed: true },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={twoReversible}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Undo deep/a.txt' }))
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('File restored')
+    })
+    expect(applyChanges).toHaveBeenCalledOnce()
+    expect(applyChanges.mock.calls[0]?.[0].action).toBe('undo')
+    expect(applyChanges.mock.calls[0]?.[0].files).toEqual([
+      { path: 'deep/a.txt', diffs: twoReversible[0]?.diffs },
+    ])
+    // The undone row locks; the untouched row and the batch action stay live.
+    await vi.waitFor(() => {
+      const done = view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement
+      expect(done.disabled).toBe(true)
+      expect(done.title).toBe('This file is already restored')
+    })
+    expect((view.getByRole('button', { name: 'Undo nested/b.txt' }) as HTMLButtonElement).disabled)
+      .toBe(false)
+    expect((view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement).disabled)
+      .toBe(false)
+  })
+
+  it('approves a file, locks its undo, and approves every file from the header', async () => {
+    const twoReversible = [
+      fileReview('deep/a.txt', [{ path: 'deep/a.txt', oldText: 'a', newText: 'A' }]),
+      fileReview('nested/b.txt', [{ path: 'nested/b.txt', oldText: 'b', newText: 'B' }]),
+    ]
+    const view = render(<ProducedFiles matched={twoReversible} openFile={() => {}} t={t} />)
+
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Approve deep/a.txt' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Approve deep/a.txt' }))
+    await vi.waitFor(() => {
+      const approved = view.getByRole('button', { name: 'Approve deep/a.txt' }) as HTMLButtonElement
+      expect(approved.disabled).toBe(true)
+      expect(approved.title).toBe('Approved')
+    })
+    // Approval locks the undo for that file only.
+    await vi.waitFor(() => {
+      const undo = view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement
+      expect(undo.disabled).toBe(true)
+      expect(undo.title).toBe('This file is approved and locked')
+    })
+    expect((view.getByRole('button', { name: 'Undo nested/b.txt' }) as HTMLButtonElement).disabled)
+      .toBe(false)
+
+    // Batch approval locks every file and disables both batch actions.
+    fireEvent.click(view.getByRole('button', { name: 'Approve all' }))
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Approve nested/b.txt' }) as HTMLButtonElement).disabled)
+        .toBe(true)
+    })
+    expect((view.getByRole('button', { name: 'Undo nested/b.txt' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+    expect((view.getByRole('button', { name: 'Approve all' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+    expect((view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+  })
+
+  it('expands and collapses the extra files at the bottom', () => {
+    const paths = ['deep/a.html', 'b.css', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts']
+    const view = render(<ProducedFiles matched={reviews(paths)} openFile={() => {}} t={t} />)
+    const card = view.getByRole('region', { name: 'Edited files' })
+    expect(within(card).queryByRole('button', { name: 'Review g.ts' })).toBeNull()
+
+    const more = within(card).getByRole('button', { name: '1 more file' })
+    expect(more.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(more)
+    expect(within(card).getByRole('button', { name: 'Review g.ts' })).toBeTruthy()
+    const collapse = within(card).getByRole('button', { name: 'Collapse' })
+    expect(collapse.getAttribute('aria-expanded')).toBe('true')
+
+    fireEvent.click(collapse)
+    expect(within(card).queryByRole('button', { name: 'Review g.ts' })).toBeNull()
+    expect(within(card).getByRole('button', { name: '1 more file' })).toBeTruthy()
+  })
+
+  it('deletes a created file from its row', async () => {
+    const createdReview = fileReview('out/new.txt', [
+      { path: 'out/new.txt', oldText: null, newText: 'hello', oldStart: 1, newStart: 1 },
+    ])
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'out/new.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'out/new.txt', state: 'undone' as const, changed: true },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[createdReview]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Undo out/new.txt' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Undo out/new.txt' }))
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('File deleted')
+    })
+    expect(applyChanges).toHaveBeenCalledOnce()
+    expect(applyChanges.mock.calls[0]?.[0].action).toBe('undo')
+    expect(applyChanges.mock.calls[0]?.[0].files).toEqual([
+      { path: 'out/new.txt', diffs: createdReview.diffs },
+    ])
+    await vi.waitFor(() => {
+      const button = view.getByRole('button', { name: 'Undo out/new.txt' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(button.title).toBe('This file is already restored')
+    })
+  })
+
+  it('includes created files in the batch undo', async () => {
+    const mixed = [
+      fileReview('a.txt', [{ path: 'a.txt', oldText: 'x', newText: 'X' }]),
+      fileReview('new.txt', [{ path: 'new.txt', oldText: null, newText: 'hi' }]),
+    ]
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'a.txt', state: 'applied' as const, changed: false },
+      { path: 'new.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'a.txt', state: 'undone' as const, changed: true },
+      { path: 'new.txt', state: 'undone' as const, changed: true },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={mixed}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Undo all' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Undo all' }))
+    await vi.waitFor(() => { expect(view.getByRole('alert')).toBeTruthy() })
+    expect(applyChanges).toHaveBeenCalledOnce()
+    expect(applyChanges.mock.calls[0]?.[0].files).toHaveLength(2)
+  })
+
+  it('explains that a created-file hunk undoes only at file level', async () => {
+    const createdReview = fileReview('out/new.txt', [
+      { path: 'out/new.txt', oldText: null, newText: 'hello' },
+    ])
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'out/new.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[createdReview]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        t={t}
+      />,
+    )
+    fireEvent.click(view.getByRole('button', { name: 'Review out/new.txt' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+
+    await vi.waitFor(() => {
+      const hunk = within(drawer).getByRole('button', { name: 'Undo this change' }) as HTMLButtonElement
+      expect(hunk.disabled).toBe(true)
+      expect(hunk.title)
+        .toBe('This change created the file; undo at the file level to delete it')
+    })
+    // The file-level undo stays available for the deletion.
+    expect((within(drawer).getByRole('button', { name: 'Undo out/new.txt' }) as HTMLButtonElement).disabled)
+      .toBe(false)
+  })
+
+  it('approves and undoes a single hunk from the drawer', async () => {
+    const twoHunks = fileReview('deep/a.txt', [
+      { path: 'deep/a.txt', oldText: 'a', newText: 'A' },
+      { path: 'deep/a.txt', oldText: 'b', newText: 'B' },
+    ])
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'undone' as const, changed: true },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[twoHunks]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.txt' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+
+    // Opening the drawer refreshes per-hunk states with one entry per hunk.
+    await vi.waitFor(() => {
+      expect(inspectChanges.mock.calls.some(call =>
+        (call[0] as { files: readonly unknown[] }).files.length === 2)).toBe(true)
+    })
+    const undoHunks = within(drawer).getAllByRole('button', { name: 'Undo this change' })
+    expect(undoHunks).toHaveLength(2)
+    await vi.waitFor(() => {
+      expect((undoHunks[0] as HTMLButtonElement).disabled).toBe(false)
+    })
+    fireEvent.click(undoHunks[0]!)
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('File restored')
+    })
+    expect(applyChanges).toHaveBeenCalledOnce()
+    expect(applyChanges.mock.calls[0]?.[0].action).toBe('undo')
+    expect(applyChanges.mock.calls[0]?.[0].files).toEqual([
+      { path: 'deep/a.txt', diffs: [twoHunks.diffs[0]] },
+    ])
+    // The undone hunk locks; the sibling hunk stays live.
+    await vi.waitFor(() => {
+      const first = within(drawer).getAllByRole('button', { name: 'Undo this change' })[0] as HTMLButtonElement
+      expect(first.disabled).toBe(true)
+      expect(first.title).toBe('This change is already restored')
+    })
+    expect(
+      (within(drawer).getAllByRole('button', { name: 'Undo this change' })[1] as HTMLButtonElement).disabled,
+    ).toBe(false)
+    // A partially undone file can no longer be undone as a whole.
+    await vi.waitFor(() => {
+      expect((within(drawer).getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement).disabled)
+        .toBe(true)
+    })
+  })
+
+  it('approves a hunk from the drawer and locks only that change', async () => {
+    const twoHunks = fileReview('deep/a.txt', [
+      { path: 'deep/a.txt', oldText: 'a', newText: 'A' },
+      { path: 'deep/a.txt', oldText: 'b', newText: 'B' },
+    ])
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[twoHunks]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        t={t}
+      />,
+    )
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.txt' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+
+    const approveHunks = within(drawer).getAllByRole('button', { name: 'Approve this change' })
+    expect(approveHunks).toHaveLength(2)
+    await vi.waitFor(() => {
+      expect((approveHunks[0] as HTMLButtonElement).disabled).toBe(false)
+    })
+    fireEvent.click(approveHunks[0]!)
+    await vi.waitFor(() => {
+      const first = within(drawer).getAllByRole('button', { name: 'Approve this change' })[0] as HTMLButtonElement
+      expect(first.disabled).toBe(true)
+      expect(first.title).toBe('Approved')
+    })
+    // Only the approved hunk is locked; its sibling stays undoable.
+    const undoHunks = within(drawer).getAllByRole('button', { name: 'Undo this change' })
+    await vi.waitFor(() => {
+      expect((undoHunks[0] as HTMLButtonElement).disabled).toBe(true)
+      expect((undoHunks[1] as HTMLButtonElement).disabled).toBe(false)
+    })
+    // A whole-file undo would touch the locked hunk, so it is blocked too.
+    await vi.waitFor(() => {
+      expect((within(drawer).getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement).disabled)
+        .toBe(true)
+    })
+  })
+
+  it('approves a file from the drawer header and locks every hunk', async () => {
+    const view = render(<ProducedFiles matched={[changedReviews[0]!]} openFile={() => {}} t={t} />)
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+
+    await vi.waitFor(() => {
+      expect((within(drawer).getByRole('button', { name: 'Approve deep/a.html' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Approve deep/a.html' }))
+    await vi.waitFor(() => {
+      expect((within(drawer).getByRole('button', { name: 'Approve deep/a.html' }) as HTMLButtonElement).disabled)
+        .toBe(true)
+    })
+    // File approval locks the file undo and every hunk undo.
+    expect((within(drawer).getByRole('button', { name: 'Undo deep/a.html' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+    await vi.waitFor(() => {
+      expect((within(drawer).getAllByRole('button', { name: 'Undo this change' })[0] as HTMLButtonElement).disabled)
+        .toBe(true)
+      expect(within(drawer).getAllByRole('button', { name: 'Approve this change' })[0]!.title)
+        .toBe('Approved')
+    })
+  })
+
+  it('undoes a file from the drawer header and marks every hunk restored', async () => {
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.html', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.html', state: 'undone' as const, changed: true },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[changedReviews[0]!]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
+    const drawer = view.getByRole('dialog', { name: 'Review' })
+    await vi.waitFor(() => {
+      expect((within(drawer).getByRole('button', { name: 'Undo deep/a.html' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Undo deep/a.html' }))
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('File restored')
+    })
+    expect(applyChanges).toHaveBeenCalledOnce()
+    expect(applyChanges.mock.calls[0]?.[0].files).toEqual([
+      { path: 'deep/a.html', diffs: changedReviews[0]?.diffs },
+    ])
+    // A whole-file undo restores every recorded hunk.
+    await vi.waitFor(() => {
+      expect((within(drawer).getAllByRole('button', { name: 'Undo this change' })[0] as HTMLButtonElement).disabled)
+        .toBe(true)
+    })
+  })
+
+  it('disables a row toggle for a conflicted file and explains why', async () => {
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'conflict' as const, changed: false },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[fileReview('deep/a.txt', [{ path: 'deep/a.txt', oldText: 'a', newText: 'A' }])]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={vi.fn()}
+        t={t}
+      />,
+    )
+
+    await vi.waitFor(() => {
+      const button = view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+      expect(button.title).toBe('This file cannot be undone right now')
+    })
+  })
+
+  it('blocks the row after a single-file toggle reports a conflict', async () => {
+    const inspectChanges = vi.fn(async () => ({ files: [
+      { path: 'deep/a.txt', state: 'applied' as const, changed: false },
+    ] }))
+    const applyChanges = vi.fn(async () => ({ files: [
+      {
+        path: 'deep/a.txt', state: 'conflict' as const, changed: false,
+        reason: 'current content does not match the recorded change',
+      },
+    ] }))
+    const view = render(
+      <ProducedFiles
+        matched={[fileReview('deep/a.txt', [{ path: 'deep/a.txt', oldText: 'a', newText: 'A' }])]}
+        openFile={() => {}}
+        inspectChanges={inspectChanges}
+        applyChanges={applyChanges}
+        t={t}
+      />,
+    )
+
+    await vi.waitFor(() => {
+      expect((view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement).disabled)
+        .toBe(false)
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Undo deep/a.txt' }))
+    await vi.waitFor(() => {
+      expect(view.getByRole('alert').textContent).toContain('Could not undo this file')
+    })
+    expect(view.getByRole('alert').textContent)
+      .toContain('current content does not match the recorded change')
+    expect((view.getByRole('button', { name: 'Undo deep/a.txt' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+  })
+
+  it('reviews one file from its row and copies its unified diff', async () => {
     const writeText = vi.fn(() => Promise.resolve())
     vi.stubGlobal('navigator', { clipboard: { writeText } })
     const view = render(<ProducedFiles matched={changedReviews} openFile={() => {}} t={t} />)
 
-    fireEvent.click(view.getByRole('button', { name: 'Review all produced files' }))
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
     const drawer = view.getByRole('dialog', { name: 'Review' })
-    expect(within(drawer).getByText('2 files')).toBeTruthy()
+    expect(within(drawer).getByText('1 file')).toBeTruthy()
     expect(within(drawer).getByText('deep/a.html')).toBeTruthy()
-    expect(within(drawer).getByText('styles/b.css')).toBeTruthy()
-    expect(drawer.querySelectorAll('[data-diff-layout="unified"]')).toHaveLength(2)
+    expect(within(drawer).queryByText('styles/b.css')).toBeNull()
+    expect(drawer.querySelectorAll('[data-diff-layout="unified"]')).toHaveLength(1)
 
     fireEvent.click(within(drawer).getByRole('button', { name: 'Copy diff' }))
     await vi.waitFor(() => { expect(writeText).toHaveBeenCalledOnce() })
     expect(writeText.mock.calls[0]?.[0]).toContain('deep/a.html')
-    expect(writeText.mock.calls[0]?.[0]).toContain('styles/b.css')
+    expect(writeText.mock.calls[0]?.[0]).not.toContain('styles/b.css')
     expect(within(drawer).getByRole('button', { name: 'Copied' })).toBeTruthy()
   })
 
@@ -499,6 +1042,20 @@ describe('ProducedFiles review card', () => {
     fireEvent.click(trigger)
     fireEvent.click(view.getByRole('button', { name: 'Close' }))
     expect(view.queryByRole('dialog')).toBeNull()
+  })
+
+  it('closes the drawer when pressing outside of it', () => {
+    const view = render(<ProducedFiles matched={changedReviews} openFile={() => {}} t={t} />)
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
+    expect(view.getByRole('dialog', { name: 'Review' })).toBeTruthy()
+
+    fireEvent.pointerDown(document.body)
+    expect(view.queryByRole('dialog')).toBeNull()
+    // A press inside the drawer keeps it open.
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
+    expect(view.getByRole('dialog', { name: 'Review' })).toBeTruthy()
+    fireEvent.pointerDown(view.getByRole('dialog', { name: 'Review' }))
+    expect(view.getByRole('dialog', { name: 'Review' })).toBeTruthy()
   })
 
   it('shows review paths relative to the Session project while opening the absolute path', () => {
@@ -548,7 +1105,7 @@ describe('ProducedFiles review card', () => {
   it('resizes the drawer by dragging or keyboard and persists the chosen width', () => {
     const innerWidth = vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1024)
     const view = render(<ProducedFiles matched={changedReviews} openFile={() => {}} t={t} />)
-    fireEvent.click(view.getByRole('button', { name: 'Review all produced files' }))
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
     const drawer = view.getByRole('dialog', { name: 'Review' })
     const handle = within(drawer).getByRole('separator', { name: 'Resize review panel' })
 
@@ -591,7 +1148,7 @@ describe('ProducedFiles review card', () => {
     const frame = view.getByTestId('host-frame')
     const details = view.getByTestId('host-details')
 
-    fireEvent.click(view.getByRole('button', { name: 'Review all produced files' }))
+    fireEvent.click(view.getByRole('button', { name: 'Review deep/a.html' }))
     expect(frame.style.gridTemplateColumns)
       .toBe('280px minmax(0, 1fr) var(--dsh-file-review-drawer-width)')
     expect(frame.style.getPropertyValue('--dsh-file-review-drawer-width')).toBe('36vw')

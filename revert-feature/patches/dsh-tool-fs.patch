@@ -1,0 +1,248 @@
+diff --git "a/C:\\Program Files\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh-tool-fs\\lib\\index.js" "b/C:\\xhl\\agent-work\\dsh-file-review\\revert-feature\\staged\\dsh-tool-fs\\lib\\index.js"
+index 5da0e65..14fc74e 100644
+--- "a/C:\\Program Files\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh-tool-fs\\lib\\index.js"	
++++ "b/C:\\xhl\\agent-work\\dsh-file-review\\revert-feature\\staged\\dsh-tool-fs\\lib\\index.js"
+@@ -525,6 +525,23 @@ function diffsFromMeta(meta) {
+ 	if (!Array.isArray(diffs) || diffs.length === 0 || !diffs.every(isFileDiff)) return void 0;
+ 	return diffs;
+ }
++/**
++* Narrow opaque result metadata to a revertible basis: the LF-normalized file
++* text before the mutation plus the model-facing path, recorded by
++* `presentationMeta` when the file was small enough to persist. Malformed or
++* missing metadata returns `undefined` so the revert command and presentation
++* can fall back instead of throwing during replay.
++* @param meta - result metadata.
++* @returns the validated revert basis, or `undefined` for absent or malformed data.
++*/
++function revertFromMeta(meta) {
++	if (typeof meta !== "object" || meta === null || Array.isArray(meta)) return void 0;
++	const revert = meta.revert;
++	if (typeof revert !== "object" || revert === null || Array.isArray(revert)) return void 0;
++	const { path, before } = revert;
++	if (typeof path !== "string" || path.length === 0 || typeof before !== "string") return void 0;
++	return { path, before };
++}
+ //#endregion
+ //#region lib/types/error.js
+ /**
+@@ -595,7 +612,7 @@ ${outcome.operation === "create" ? "Created" : "Updated"} file
+ * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
+ * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
+ */
+-function applyWriteTool(ctx, sandbox) {
++function applyWriteTool(ctx, sandbox, revertMaxBytes) {
+ 	ctx.systemPrompt.section({
+ 		name: "tool:write",
+ 		order: 101,
+@@ -645,11 +662,17 @@ function applyWriteTool(ctx, sandbox) {
+ 				type: "text",
+ 				text: formatWriteOutput(value.path, value)
+ 			}],
+-			presentationMeta: (args, value) => ({ diffs: value.before === null ? [] : computeHunkDiffs(args.file_path, value.before, value.after).map(({ path, oldText, newText }) => ({
+-				path,
+-				oldText,
+-				newText
+-			})) })
++			presentationMeta: (args, value) => {
++				const diffs = value.before === null ? [] : computeHunkDiffs(args.file_path, value.before, value.after).map(({ path, oldText, newText }) => ({
++					path,
++					oldText,
++					newText
++				}));
++				return {
++					diffs,
++					...value.before !== null && value.before.length <= revertMaxBytes ? { revert: { path: args.file_path, before: value.before } } : {}
++				};
++			}
+ 		},
+ 		async execute(args, exec) {
+ 			const input = parseWriteArgs(args);
+@@ -692,10 +715,12 @@ function applyWriteTool(ctx, sandbox) {
+ 				oldText: null,
+ 				newText: args.content
+ 			}];
++			const revert = revertFromMeta(result.meta);
+ 			return {
+ 				card: "diff",
+ 				title: `Write ${args.file_path}`,
+-				diffs
++				diffs,
++				...revert !== void 0 ? { revert: { path: revert.path } } : {}
+ 			};
+ 		}
+ 	}));
+@@ -740,7 +765,7 @@ function formatEditOutput(displayPath, replaceAll) {
+ * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
+ * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
+ */
+-function applyEditTool(ctx, sandbox) {
++function applyEditTool(ctx, sandbox, revertMaxBytes) {
+ 	ctx.systemPrompt.section({
+ 		name: "tool:edit",
+ 		order: 102,
+@@ -794,11 +819,17 @@ function applyEditTool(ctx, sandbox) {
+ 				type: "text",
+ 				text: formatEditOutput(value.path, args.replace_all ?? false)
+ 			}],
+-			presentationMeta: (args, value) => ({ diffs: computeHunkDiffs(args.file_path, value.before, value.after).map(({ path, oldText, newText }) => ({
+-				path,
+-				oldText,
+-				newText
+-			})) })
++			presentationMeta: (args, value) => {
++				const diffs = computeHunkDiffs(args.file_path, value.before, value.after).map(({ path, oldText, newText }) => ({
++					path,
++					oldText,
++					newText
++				}));
++				return {
++					diffs,
++					...value.before.length <= revertMaxBytes ? { revert: { path: args.file_path, before: value.before } } : {}
++				};
++			}
+ 		},
+ 		async execute(args, exec) {
+ 			const input = parseEditArgs(args);
+@@ -841,15 +872,101 @@ function applyEditTool(ctx, sandbox) {
+ 			if (result.isError) return void 0;
+ 			const diffs = diffsFromMeta(result.meta);
+ 			if (diffs === void 0) return void 0;
++			const revert = revertFromMeta(result.meta);
+ 			return {
+ 				card: "diff",
+ 				title: `Edit ${args.file_path}`,
+-				diffs
++				diffs,
++				...revert !== void 0 ? { revert: { path: revert.path } } : {}
+ 			};
+ 		}
+ 	}));
+ }
+ //#endregion
++//#region lib/types/revert.js
++/**
++* User-initiated file revert: `/fs_revert <callId>` restores a file to the
++* LF-normalized text recorded in the matching edit/write tool result's meta
++* (the `revert` basis `presentationMeta` persists for files under
++* `revertMaxBytes`). The command runs in the session agent context, so the
++* write travels the ordinary observation-policy waterfall (`fs/write-intent`)
++* and re-observes the outcome; the current file's line-ending style is
++* restored so a CRLF file stays CRLF. There is deliberately no tool surface:
++* the model should not rewrite history it did not record. A user clicking
++* "撤回" on a diff card is the sole entry point.
++* @module @deepseek-ai/dsh-tool-fs/revert
++*/
++/** Default cap for persisting a revert basis into tool-result meta (see the `revertMaxBytes` config). */
++const REVERT_MAX_BYTES = 1024 * 1024;
++/** Parse the `/fs_revert` command's raw input into a bare tool call id. */
++function parseRevertCallId(rawInput) {
++	return typeof rawInput === "string" ? rawInput.trim() : "";
++}
++/**
++* Locate a revertible edit/write in the session log by its tool call id. The
++* command is authorized by the conversation itself: only calls this session
++* actually recorded — and only edit/write calls, the sole producers of a
++* `revert` meta — can be reverted, and only to the exact text persisted at
++* execution time.
++* @param session - the live session whose event log carries the tool result.
++* @param callId - the tool call id rendered on the diff card.
++* @returns the recorded basis, or `undefined` when no revertible call matches.
++*/
++function findRevertBasis(session, callId) {
++	for (const event of session?.events ?? []) {
++		if (event?.type !== "tool/result") continue;
++		if (event.data?.message?.source?.callId !== callId) continue;
++		const basis = revertFromMeta(event.data.meta);
++		if (basis !== void 0) return basis;
++	}
++	return void 0;
++}
++/** Majority-rule line-ending detection over a bounded sample (mirrors `dsh-fs-local`). */
++function detectLineEndings(raw) {
++	const sample = raw.slice(0, 4096);
++	const crlfCount = sample.split("\r\n").length - 1;
++	return crlfCount > sample.split("\n").length - 1 - crlfCount ? "CRLF" : "LF";
++}
++/** Render LF-normalized text in the given line-ending style. */
++function restoreLineEndings(content, lineEndings) {
++	return lineEndings === "LF" ? content : content.split("\n").join("\r\n");
++}
++/** Register the user-facing `/fs_revert` command over the same fs the tools use. */
++function applyRevertCommand(ctx, sandbox) {
++	ctx.commands.register({
++		name: "fs_revert",
++		description: "Revert a file to its recorded content before an edit/write tool call. Usage: /fs_revert <callId>",
++		async handler({ agent, rawInput, signal }) {
++			const callId = parseRevertCallId(rawInput);
++			if (callId === "") return { kind: "error", text: "Usage: /fs_revert <callId>" };
++			const basis = findRevertBasis(agent.session, callId);
++			if (basis === void 0) return { kind: "error", text: `no revertible edit/write found for call ${callId} in this session` };
++			let sandboxPolicy;
++			try {
++				const exec = { agent, signal };
++				sandboxPolicy = await sandbox.resolvePolicy("write", { file_path: basis.path }, exec);
++				const target = await ctx.fs.resolve(basis.path, sessionResolveOptions(exec, basis.path, sandboxPolicy?.workspaceRoot));
++				let intent = await ctx.waterfall("fs/write-intent", target, exec, () => void 0);
++				if (intent?.kind === "createIfAbsent") {
++					const info = await ctx.fs.stat(target, signal);
++					if (info !== void 0 && info.type === "file") {
++						ctx.emit("fs/observed", target, { kind: "present", version: info.version }, exec);
++						intent = await ctx.waterfall("fs/write-intent", target, exec, () => void 0);
++					}
++				}
++				const current = await ctx.fs.readText(target, signal).catch(() => void 0);
++				const content = restoreLineEndings(basis.before, current === void 0 ? "LF" : detectLineEndings(current));
++				const outcome = await ctx.fs.writeText(target, content, intent, signal, sandboxPolicy);
++				ctx.emit("fs/observed", target, { kind: "present", version: outcome.version }, exec);
++				return { kind: "success", text: `Reverted ${target.displayPath} to its content before call ${callId}.` };
++			} catch (error) {
++				const mapped = remediateFsError(sandbox.mapError(error, sandboxPolicy));
++				return { kind: "error", text: mapped instanceof Error ? mapped.message : String(mapped) };
++			}
++		}
++	});
++}
++//#endregion
+ //#region lib/types/read-image.js
+ /**
+ * The model-facing `read_image` tool: reads a PNG/JPEG/WebP/GIF file, durably
+@@ -1182,13 +1299,15 @@ const name = "tool-fs";
+ const inject = [
+ 	"tools",
+ 	"fs",
+-	"systemPrompt"
++	"systemPrompt",
++	"commands"
+ ];
+ const Config = z.object({
+ 	readLimit: z.number().default(READ_LIMIT),
+ 	readMaxLineLength: z.number().default(READ_MAX_LINE_LENGTH),
+ 	readMaxBytes: z.number().default(READ_MAX_BYTES),
+-	readStreamMinSize: z.number().default(STREAM_MIN_SIZE)
++	readStreamMinSize: z.number().default(STREAM_MIN_SIZE),
++	revertMaxBytes: z.number().default(REVERT_MAX_BYTES)
+ });
+ /** Every read cap counts lines/chars/bytes — a positive integer, or windowing arithmetic misbehaves silently. */
+ function assertPositiveInteger(name, value) {
+@@ -1201,6 +1320,7 @@ function apply(ctx, config) {
+ 	assertPositiveInteger("readMaxLineLength", resolved.readMaxLineLength);
+ 	assertPositiveInteger("readMaxBytes", resolved.readMaxBytes);
+ 	assertPositiveInteger("readStreamMinSize", resolved.readStreamMinSize);
++	assertPositiveInteger("revertMaxBytes", resolved.revertMaxBytes);
+ 	applyReadTool(ctx, {
+ 		limit: resolved.readLimit,
+ 		maxLineLength: resolved.readMaxLineLength,
+@@ -1211,8 +1331,9 @@ function apply(ctx, config) {
+ 		applyReadImageTool(imageCtx);
+ 	});
+ 	const sandbox = new FsSandboxController(ctx);
+-	applyWriteTool(ctx, sandbox);
+-	applyEditTool(ctx, sandbox);
++	applyWriteTool(ctx, sandbox, resolved.revertMaxBytes);
++	applyEditTool(ctx, sandbox, resolved.revertMaxBytes);
++	applyRevertCommand(ctx, sandbox);
+ }
+ //#endregion
+-export { Config, apply, inject, name };
++export { Config, apply, inject, name, detectLineEndings, findRevertBasis, parseRevertCallId, restoreLineEndings, revertFromMeta };

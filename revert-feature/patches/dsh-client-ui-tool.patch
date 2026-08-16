@@ -1,0 +1,172 @@
+diff --git "a/C:\\Program Files\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh-client-ui-tool\\lib\\client.js" "b/C:\\xhl\\agent-work\\dsh-file-review\\revert-feature\\staged\\dsh-client-ui-tool\\lib\\client.js"
+index 00c029f..3e6ed68 100644
+--- "a/C:\\Program Files\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh-client-ui-tool\\lib\\client.js"	
++++ "b/C:\\xhl\\agent-work\\dsh-file-review\\revert-feature\\staged\\dsh-client-ui-tool\\lib\\client.js"
+@@ -256,6 +256,20 @@ window.__ModuleLoader__.load({
+ 			return out;
+ 		}
+ 		/**
++		* Narrow the wire diff card's `revert` marker to a well-formed path. The
++		* marker exists only when the tool result recorded a revertible basis (the
++		* file text before the mutation, persisted under the server's
++		* `revertMaxBytes` cap); an absent or malformed marker just disables the
++		* revert button, it never routes the card off the diff path.
++		* @param revert - the view's `revert` field, unverified.
++		* @returns the validated revert path, or null for absent or malformed data.
++		*/
++		function narrowRevert(revert) {
++			if (typeof revert !== "object" || revert === null || Array.isArray(revert)) return null;
++			const { path } = revert;
++			return typeof path === "string" && path.length > 0 ? { path } : null;
++		}
++		/**
+ 		* Derive the diff-card props for a tool call, or null when this call is not a
+ 		* diff card and belongs on the generic path.
+ 		*
+@@ -270,10 +284,14 @@ window.__ModuleLoader__.load({
+ 		* result view is generic (how write/edit keep their execution errors on the
+ 		* generic path).
+ 		*
+-		* This derivation consumes only `diffs`; the render intent's `title` field is
+-		* deliberately dropped. The row supplies its own title (`Edit`/`Write · path`
+-		* from the args), which outranks the view's `title`. A tool that names its own
+-		* diff header therefore does not surface that text on the Web row.
++		* This derivation consumes `diffs` and the optional `revert` marker. The
++		* render intent's `title` field is deliberately dropped. The row supplies
++		* its own title (`Edit`/`Write · path` from the args), which outranks the
++		* view's `title`. A tool that names its own diff header therefore does not
++		* surface that text on the Web row. The revert marker rides alongside:
++		* result-side only, so a running call never offers a revert button and a
++		* settled call without a persisted basis (a create, or an oversized file)
++		* does not either.
+ 		* @param block - RunningToolCall or ToolResultNode off the snapshot caches.
+ 		* @returns the diff-card props, or null for the generic path.
+ 		*/
+@@ -285,7 +303,12 @@ window.__ModuleLoader__.load({
+ 			}
+ 			const result = block.resultView?.card === "diff" ? block.resultView : null;
+ 			const diffs = result === null ? null : narrowDiffs(result.diffs);
+-			return diffs === null ? null : { card: { diffs } };
++			if (diffs === null) return null;
++			const revert = narrowRevert(result?.revert);
++			return {
++				card: { diffs },
++				...(revert === null ? {} : { revert })
++			};
+ 		}
+ 		//#endregion
+ 		//#region lib/types/client/tool/models/search-card-model.js
+@@ -657,8 +680,29 @@ window.__ModuleLoader__.load({
+ 				default: return null;
+ 			}
+ 		}
+-		function ToolRow({ t, variant, toolName, icon, title, summary, summarySuffix, body, output, errorSummary, terminal, diff, read, search, web, state, filePath, onOpenFile, inspect }) {
++		function ToolRow({ t, variant, toolName, icon, title, summary, summarySuffix, body, output, errorSummary, terminal, diff, read, search, web, state, filePath, onOpenFile, inspect, revert }) {
+ 			const [expanded, setExpanded] = (0, react.useState)(false);
++			const [revertState, setRevertState] = (0, react.useState)(null);
++			const revertRunning = revertState?.phase === "running";
++			const revertLabel = revertState === null || revertState.phase === "idle" ? "撤回" : revertState.phase === "confirm" ? "确认撤回？" : revertState.phase === "running" ? "撤回中…" : revertState.phase === "done" ? "已撤回" : "撤回失败";
++			const onRevertClick = (event) => {
++				event.stopPropagation();
++				if (revertState === null || revertState.phase === "idle") {
++					setRevertState({ phase: "confirm" });
++					return;
++				}
++				if (revertState.phase === "error") {
++					setRevertState(null);
++					return;
++				}
++				if (revertState.phase !== "confirm" || revert === void 0) return;
++				setRevertState({ phase: "running" });
++				Promise.resolve(revert.onRevert()).then((outcome) => {
++					setRevertState({ phase: "done", text: outcome?.text ?? "已撤回" });
++				}, (error) => {
++					setRevertState({ phase: "error", text: error instanceof Error ? error.message : String(error) });
++				});
++			};
+ 			const terminalBody = terminal ?? null;
+ 			const diffBody = diff ?? null;
+ 			const readBody = read ?? null;
+@@ -791,6 +835,14 @@ window.__ModuleLoader__.load({
+ 							className: ToolRow_module_css_default.inspectButton,
+ 							onClick: inspect,
+ 							children: [(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconInspectOutline12, {}), "Inspect"]
++						}),
++						revert !== void 0 && (0, react_jsx_runtime.jsx)("button", {
++							type: "button",
++							className: ToolRow_module_css_default.inspectButton,
++							onClick: onRevertClick,
++							disabled: revertRunning,
++							title: revertState?.text ?? `撤回 ${revert.path}`,
++							children: revertLabel
+ 						})]
+ 					})
+ 				})]
+@@ -1275,7 +1327,7 @@ window.__ModuleLoader__.load({
+ 		* model-facing error text through its Output section and its first line in the
+ 		* collapsed summary instead.
+ 		*/
+-		function FileMutationRow({ toolName, block, cwd, openFile, inspect, t }) {
++		function FileMutationRow({ toolName, block, cwd, openFile, inspect, onRevertFile, t }) {
+ 			const model = toolRowModel(toolName, block, cwd);
+ 			const diff = diffCardModel(block);
+ 			return (0, react_jsx_runtime.jsx)(ToolRow, {
+@@ -1292,7 +1344,13 @@ window.__ModuleLoader__.load({
+ 				state: model.state,
+ 				filePath: model.filePath,
+ 				onOpenFile: openFile,
+-				inspect
++				inspect,
++				...(diff !== null && diff.revert !== void 0 && onRevertFile !== void 0 ? {
++					revert: {
++						path: diff.revert.path,
++						onRevert: () => onRevertFile(block.callId)
++					}
++				} : {})
+ 			});
+ 		}
+ 		/**
+@@ -1301,23 +1359,39 @@ window.__ModuleLoader__.load({
+ 		*/
+ 		const fileMutationToolview = {
+ 			name: "file-mutation-toolview",
+-			inject: ["slots"],
++			inject: ["slots", "remote.commands"],
+ 			/**
+ 			* Register the file-mutation row into the Tool-owned keyed view slot
+-			* under both mutation tool names.
++			* under both mutation tool names. The session-scoped inject face
++			* supplies `onRevertFile`, which runs the host `/fs_revert` command
++			* against this session so the revert write happens in the session's
++			* agent context (observation policy, line endings, re-observation).
+ 			* @param ctx - registrant context (disposal rides ctx.effect inside slots.register).
+ 			*/
+ 			apply(ctx) {
++				const makeOnRevertFile = (sessionId) => async (callId) => {
++					const result = await ctx.remote.commands.execute(sessionId, `/fs_revert ${callId}`);
++					if (!result.ok) throw new Error(result.error?.message ?? "revert command failed");
++					if (result.value === void 0) throw new Error("revert command unavailable");
++					if (result.value.kind === "error") throw new Error(result.value.text ?? "revert failed");
++					return result.value;
++				};
+ 				ctx.slots.inject("tool.call.toolview", function* () {
+ 					yield ctx.slots.register({
+ 						name: "tool.call.toolview",
+ 						key: "edit",
+-						locale: CONVERSATION_NS
++						locale: CONVERSATION_NS,
++						inject: (sessionId) => ({
++							onRevertFile: makeOnRevertFile(sessionId)
++						})
+ 					}, FileMutationRow);
+ 					yield ctx.slots.register({
+ 						name: "tool.call.toolview",
+ 						key: "write",
+-						locale: CONVERSATION_NS
++						locale: CONVERSATION_NS,
++						inject: (sessionId) => ({
++							onRevertFile: makeOnRevertFile(sessionId)
++						})
+ 					}, FileMutationRow);
+ 				});
+ 			}

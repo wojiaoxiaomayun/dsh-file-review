@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { pathToFileURL } from 'node:url'
+import { URL as FileURL } from 'node:url'
 import * as React from 'react'
 import * as jsxRuntime from 'react/jsx-runtime'
+import * as ReactDOM from 'react-dom'
 import { describe, expect, it } from 'vitest'
 
 interface ClientHandoff {
@@ -16,13 +17,17 @@ describe('published browser artifact', () => {
       __ModuleLoader__?: { load(value: ClientHandoff): void }
     }
     browserWindow.__ModuleLoader__ = { load: (value) => { handoff = value } }
-    const artifact = pathToFileURL(new URL('../lib/client.js', import.meta.url).pathname)
+    // Vite rewrites literal `new URL(` calls (and the jsdom global URL
+    // mis-resolves `file:` bases), so build the artifact URL through an
+    // aliased node:url URL constructor instead.
+    const artifact = new FileURL('../lib/client.js', import.meta.url)
     await import(/* @vite-ignore */ `${artifact.href}?test=${String(Date.now())}`)
 
     expect(handoff?.id).toBe('dsh-file-review')
     const shared: Record<string, unknown> = {
       react: React,
       'react/jsx-runtime': jsxRuntime,
+      'react-dom': ReactDOM,
     }
     const client = handoff?.factory((id) => {
       if (!(id in shared)) throw new Error(`unexpected shared module: ${id}`)

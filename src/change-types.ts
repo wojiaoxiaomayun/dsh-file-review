@@ -13,6 +13,8 @@ export interface ProducedFileDiff {
 export interface ProducedFileReview {
   readonly path: string
   readonly diffs: readonly ProducedFileDiff[]
+  /** Which tool command produced the file, e.g. `insert`, `str_replace`. */
+  readonly sources?: readonly string[] | undefined
 }
 
 /** Direction requested by the produced-files toggle. */

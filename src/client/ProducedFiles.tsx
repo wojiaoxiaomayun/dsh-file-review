@@ -2,15 +2,16 @@
 // come from mutation-tool results, never from the closing prose.
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type {
   CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent,
 } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {
-  FileReviewAction, FileReviewRequest, FileReviewResult,
+  FileReviewFileState, FileReviewRequest, FileReviewResult,
 } from '../change-types.ts'
-import { basename, type ProducedFileReview } from './turn-deliverables.ts'
+import { basename, type ProducedFileDiff, type ProducedFileReview } from './turn-deliverables.ts'
 import type { NS } from './locales.ts'
 import {
   summarizeDiffs, UnifiedDiff, unifiedDiffText, type UnifiedDiffStats,
@@ -163,6 +164,32 @@ function displayPath(path: string, projectRoot: string | undefined): string {
     : path
 }
 
+/** Stable identity of one hunk within one file's recorded change list. */
+function hunkId(path: string, index: number): string {
+  return `${path}#${index}`
+}
+
+/** A hunk is reversible when the Host can locate and replace both sides. */
+function hunkReversible(path: string, diff: ProducedFileDiff): boolean {
+  return diff.path === path
+    && diff.oldText !== null
+    && diff.oldText !== diff.newText
+    && (diff.oldText !== '' || diff.oldStart !== undefined)
+    && (diff.newText !== '' || diff.newStart !== undefined)
+}
+
+/**
+ * A file's recorded change is undoable when it is a set of reversible edits,
+ * or a creation (first hunk has no old text) whose later hunks are reversible
+ * edits — undoing a creation deletes the file on the Host.
+ */
+function fileUndoable(path: string, diffs: readonly ProducedFileDiff[]): boolean {
+  const [first, ...rest] = diffs
+  if (first === undefined) return false
+  if (first.oldText === null) return rest.every(diff => hunkReversible(path, diff))
+  return diffs.every(diff => hunkReversible(path, diff))
+}
+
 const unavailableChanges = async (request: FileReviewRequest): Promise<FileReviewResult> => ({
   files: request.files.map(file => ({
     path: file.path,
@@ -177,15 +204,6 @@ function FileIcon() {
     <svg viewBox="0 0 20 20" aria-hidden="true" className={css.icon}>
       <path d="M5.25 2.75h6l3.5 3.5v10a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1V3.75a1 1 0 0 1 1-1Z" />
       <path d="M11.25 2.75v3.5h3.5M7 10h5M7 13h5" />
-    </svg>
-  )
-}
-
-function ReviewIcon() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true" className={css.buttonIcon}>
-      <path d="M4.5 3.5h8a1 1 0 0 1 1 1v3M6.5 6.5h4M6.5 9.5h2.25" />
-      <path d="m10.5 13 1.5 1.5 3.5-4" />
     </svg>
   )
 }
@@ -220,6 +238,64 @@ function ErrorIcon() {
     <svg viewBox="0 0 20 20" aria-hidden="true" className={css.noticeIconSvg}>
       <circle cx="10" cy="10" r="6.5" />
       <path d="m7.5 7.5 5 5m0-5-5 5" />
+    </svg>
+  )
+}
+
+// Iconography below is from lucide (Iconify), viewBox 0 0 24 24, drawn in
+// currentColor so the approved/locked states can tint it.
+
+function ApproveIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={css.toggleIcon}>
+      <path
+        fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"
+        strokeWidth={2} d="M20 6L9 17l-5-5"
+      />
+    </svg>
+  )
+}
+
+function ApproveAllIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={css.toggleIcon}>
+      <path
+        fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"
+        strokeWidth={2} d="M18 6L7 17l-5-5m20-2l-7.5 7.5L13 16"
+      />
+    </svg>
+  )
+}
+
+function UndoIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={css.toggleIcon}>
+      <g fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}>
+        <path d="M3 7v6h6" />
+        <path d="M21 17a9 9 0 0 0-9-9a9 9 0 0 0-6 2.3L3 13" />
+      </g>
+    </svg>
+  )
+}
+
+function UndoAllIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={css.toggleIcon}>
+      <g fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}>
+        <path d="M9 14L4 9l5-5" />
+        <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" />
+      </g>
+    </svg>
+  )
+}
+
+function LoaderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={css.loaderIcon}>
+      <path
+        fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"
+        strokeWidth={2} d="M21 12a9 9 0 1 1-6.219-8.56"
+      />
     </svg>
   )
 }
@@ -320,13 +396,27 @@ export function ProducedFiles({
   const [currentViewportWidth, setCurrentViewportWidth] = useState(viewportWidth)
   const [isResizing, setIsResizing] = useState(false)
   const [isHostSplit, setIsHostSplit] = useState(false)
-  const [toggleAction, setToggleAction] = useState<FileReviewAction>('undo')
   const [statusPending, setStatusPending] = useState(true)
   const [togglePending, setTogglePending] = useState(false)
+  /** Last known Host state per produced file, driving each row's own undo. */
+  const [fileStates, setFileStates] = useState<ReadonlyMap<string, FileReviewFileState>>(() => new Map())
+  /** Files with an in-flight per-file undo. */
+  const [filePending, setFilePending] = useState<ReadonlySet<string>>(() => new Set())
+  /** Files the user approved; approval locks the file against further undo. */
+  const [approved, setApproved] = useState<ReadonlySet<string>>(() => new Set())
+  /** Hunk-level approvals keyed by `${path}#${index}`; locks that hunk. */
+  const [approvedHunks, setApprovedHunks] = useState<ReadonlySet<string>>(() => new Set())
+  /** Last known Host state per hunk, refreshed while the review drawer is open. */
+  const [hunkStates, setHunkStates] = useState<ReadonlyMap<string, FileReviewFileState>>(() => new Map())
+  /** Hunk-level undo requests in flight. */
+  const [hunkPending, setHunkPending] = useState<ReadonlySet<string>>(() => new Set())
+  /** Whether the file list shows every file instead of the six-file preview. */
+  const [expanded, setExpanded] = useState(false)
   const [toast, setToast] = useState<ToggleNotice | null>(null)
   const toastSeqRef = useRef(0)
   const reviewOwnerRef = useRef(Symbol('review-drawer-owner'))
   const cardRef = useRef<HTMLElement>(null)
+  const drawerRef = useRef<HTMLElement>(null)
   const hostSplitRef = useRef<ActiveHostSplit | null>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
@@ -349,15 +439,50 @@ export function ProducedFiles({
     diffs: review.diffs,
   })), [reviews])
   const reversiblePaths = useMemo(() => new Set(reviews.filter(review =>
-    review.diffs.length > 0 && review.diffs.every(diff =>
-      diff.path === review.path
-      && diff.oldText !== null
-      && diff.oldText !== diff.newText
-      && (diff.oldText !== '' || diff.oldStart !== undefined)
-      && (diff.newText !== '' || diff.newStart !== undefined))).map(review => review.path)), [reviews])
-  const hasReversibleFiles = reversiblePaths.size > 0
-  const shown = reviewsWithStats.slice(0, SHOWN_LIMIT)
-  const hidden = reviewsWithStats.length - shown.length
+    fileUndoable(review.path, review.diffs)).map(review => review.path)), [reviews])
+  const anyFilePending = filePending.size > 0
+  const shown = expanded ? reviewsWithStats : reviewsWithStats.slice(0, SHOWN_LIMIT)
+  const hidden = expanded ? 0 : reviewsWithStats.length - shown.length
+  /**
+   * Files a whole-file undo may still run on: reversible, not approved, no
+   * approved or partially undone hunk, and not blocked on disk. Unknown hunk
+   * states count as safe; the Host re-checks every hunk before writing.
+   */
+  const undoablePaths = useMemo(() => {
+    const locked = new Set<string>()
+    for (const review of reviews) {
+      for (let index = 0; index < review.diffs.length; index += 1) {
+        const id = hunkId(review.path, index)
+        if (approvedHunks.has(id)
+          || (hunkStates.get(id) !== undefined && hunkStates.get(id) !== 'applied')) {
+          locked.add(review.path)
+          break
+        }
+      }
+    }
+    return new Set([...reversiblePaths].filter(path =>
+      !approved.has(path)
+      && !locked.has(path)
+      && fileStates.get(path) !== 'undone'
+      && fileStates.get(path) !== 'conflict'
+      && fileStates.get(path) !== 'error'))
+  }, [approved, approvedHunks, fileStates, hunkStates, reversiblePaths, reviews])
+  const hasUndoableFiles = undoablePaths.size > 0
+  const allApproved = reviews.length > 0 && approved.size >= reviews.length
+  /** Human explanation for a disabled whole-file undo. */
+  const undoTitleFor = (path: string): string | undefined => {
+    if (!reversiblePaths.has(path)) return t('produced.toggleUnavailable')
+    const state = fileStates.get(path)
+    const review = reviews.find(item => item.path === path)
+    const hasApprovedHunk = review?.diffs.some((_, index) => approvedHunks.has(hunkId(path, index))) ?? false
+    const hunkPartiallyUndone = review?.diffs.some((_, index) =>
+      hunkStates.get(hunkId(path, index)) === 'undone') ?? false
+    if (approved.has(path) || hasApprovedHunk) return t('produced.approvedLocked')
+    if (state === 'undone') return t('produced.alreadyUndone')
+    if (hunkPartiallyUndone) return t('produced.hunkPartiallyUndone')
+    if (state === 'conflict' || state === 'error') return t('produced.fileToggleBlocked')
+    return undefined
+  }
   const visibleReviews = useMemo(() => reviewScope?.kind === 'file'
     ? reviews.filter(review => review.path === reviewScope.path)
     : reviews, [reviewScope, reviews])
@@ -375,27 +500,21 @@ export function ProducedFiles({
     setToast({ seq: toastSeqRef.current, ...notice })
   }, [])
 
-  const phaseForResult = useCallback((
-    result: FileReviewResult,
-    currentAction: FileReviewAction,
-  ): FileReviewAction => {
-    if (reversiblePaths.size === 0) return 'undo'
-    const byPath = new Map(result.files.map(file => [file.path, file]))
-    const target = currentAction === 'undo' ? 'undone' : 'applied'
-    return [...reversiblePaths].every(path => byPath.get(path)?.state === target)
-      ? (currentAction === 'undo' ? 'redo' : 'undo')
-      : currentAction
-  }, [reversiblePaths])
+  /** Merge Host per-file states into the row state table (never removes entries). */
+  const recordFileStates = useCallback((result: FileReviewResult) => {
+    setFileStates(current => {
+      const next = new Map(current)
+      for (const file of result.files) next.set(file.path, file.state)
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     let active = true
     setStatusPending(true)
     void inspectChanges({ action: 'undo', files: toggleFiles }).then((result) => {
       if (!active) return
-      const allUndone = reversiblePaths.size > 0
-        && [...reversiblePaths].every(path =>
-          result.files.find(file => file.path === path)?.state === 'undone')
-      setToggleAction(allUndone ? 'redo' : 'undo')
+      recordFileStates(result)
     }).catch(() => {
       // The action remains usable after a transient inspection failure; execution
       // performs the same Host-side checks again.
@@ -403,49 +522,205 @@ export function ProducedFiles({
       if (active) setStatusPending(false)
     })
     return () => { active = false }
-  }, [inspectChanges, reversiblePaths, toggleFiles])
+  }, [inspectChanges, recordFileStates, toggleFiles])
 
-  const runToggle = useCallback(() => {
-    if (statusPending || togglePending || !hasReversibleFiles) return
-    const action = toggleAction
+  /**
+   * Undo every unlocked reversible file in one Host request. Files that are
+   * already undone, approved, or blocked are left out; the Host re-checks each
+   * included file against disk before writing.
+   */
+  const runUndoAll = useCallback(() => {
+    if (statusPending || togglePending || anyFilePending) return
+    const files = toggleFiles.filter(file => undoablePaths.has(file.path))
+    if (files.length === 0) return
     setTogglePending(true)
-    void applyChanges({ action, files: toggleFiles }).then((result) => {
-      setToggleAction(phaseForResult(result, action))
-      const targetState = action === 'undo' ? 'undone' : 'applied'
+    void applyChanges({ action: 'undo', files }).then((result) => {
+      recordFileStates(result)
       const byPath = new Map(result.files.map(file => [file.path, file]))
-      const failures: NoticeFile[] = toggleFiles.flatMap((file) => {
+      const failures: NoticeFile[] = files.flatMap((file) => {
         const outcome = byPath.get(file.path)
-        if (outcome?.state === targetState) return []
+        if (outcome?.state === 'undone') return []
         return [{ path: file.path }]
       })
       if (failures.length === 0) {
         showToast({
           tone: 'success',
-          title: t(action === 'undo' ? 'produced.undoSuccess' : 'produced.redoSuccess'),
+          title: t('produced.undoSuccess'),
           files: [],
         })
         return
       }
       showToast({
         tone: 'error',
-        title: t(action === 'undo' ? 'produced.undoPartial' : 'produced.redoPartial'),
-        description: t(action === 'undo'
-          ? 'produced.undoPartialDescription'
-          : 'produced.redoPartialDescription'),
+        title: t('produced.undoPartial'),
+        description: t('produced.undoPartialDescription'),
         files: failures,
       })
     }).catch((error: unknown) => {
       showToast({
         tone: 'error',
-        title: t(action === 'undo' ? 'produced.undoError' : 'produced.redoError'),
+        title: t('produced.undoError'),
         description: error instanceof Error ? error.message : String(error),
         files: [],
       })
     }).finally(() => { setTogglePending(false) })
   }, [
-    applyChanges, hasReversibleFiles, phaseForResult, showToast, t,
-    statusPending, toggleAction, toggleFiles, togglePending,
+    anyFilePending, applyChanges, recordFileStates, showToast, statusPending,
+    t, toggleFiles, togglePending, undoablePaths,
   ])
+
+  /** Approve one file, locking it against undo for this turn. */
+  const approveFile = useCallback((path: string) => {
+    setApproved(current => current.has(path) ? current : new Set(current).add(path))
+  }, [])
+
+  /** Approve every produced file, locking the whole turn's changes. */
+  const approveAll = useCallback(() => {
+    setApproved(current => {
+      if (current.size >= reviews.length) return current
+      return new Set(reviews.map(review => review.path))
+    })
+  }, [reviews])
+
+  /**
+   * Undo one produced file from its row or drawer header. The request carries
+   * exactly that file, so Host-side per-file safety checks still apply. A file
+   * with approved or partially undone hunks is never submitted.
+   */
+  const runFileUndo = useCallback((path: string) => {
+    const file = toggleFiles.find(item => item.path === path)
+    if (file === undefined || !undoablePaths.has(path)) return
+    if (statusPending || togglePending || anyFilePending || filePending.has(path)) return
+    setFilePending(current => new Set(current).add(path))
+    void applyChanges({ action: 'undo', files: [file] }).then((result) => {
+      const outcome = result.files.find(item => item.path === path)
+      recordFileStates(result)
+      if (outcome?.state === 'undone') {
+        // A whole-file undo restores every recorded hunk — or deletes a
+        // file this turn created.
+        const review = reviews.find(item => item.path === path)
+        const created = review?.diffs[0]?.oldText === null
+        setHunkStates(current => {
+          if (review === undefined || review.diffs.length === 0) return current
+          const next = new Map(current)
+          review.diffs.forEach((_, index) => next.set(hunkId(path, index), 'undone'))
+          return next
+        })
+        showToast({
+          tone: 'success',
+          title: t(created ? 'produced.fileDeleted' : 'produced.fileUndone'),
+          files: [],
+        })
+        return
+      }
+      showToast({
+        tone: 'error',
+        title: t('produced.fileUndoFailed'),
+        description: outcome?.reason,
+        files: [{ path }],
+      })
+    }).catch((error: unknown) => {
+      showToast({
+        tone: 'error',
+        title: t('produced.fileUndoFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        files: [],
+      })
+    }).finally(() => {
+      setFilePending(current => {
+        const next = new Set(current)
+        next.delete(path)
+        return next
+      })
+    })
+  }, [
+    anyFilePending, applyChanges, filePending, recordFileStates, reviews,
+    showToast, statusPending, t, toggleFiles, togglePending, undoablePaths,
+  ])
+
+  /** Approve one hunk in the drawer, locking that change against undo. */
+  const approveHunk = useCallback((path: string, index: number) => {
+    const id = hunkId(path, index)
+    setApprovedHunks(current => current.has(id) ? current : new Set(current).add(id))
+  }, [])
+
+  /**
+   * Undo exactly one recorded hunk. The Host treats the hunk as its own
+   * change (`{ path, diffs: [hunk] }`), so it only touches that segment and
+   * re-validates it against disk before writing.
+   */
+  const runHunkUndo = useCallback((path: string, index: number) => {
+    const review = reviews.find(item => item.path === path)
+    const diff = review?.diffs[index]
+    if (review === undefined || diff === undefined || !hunkReversible(path, diff)) return
+    const id = hunkId(path, index)
+    if (statusPending || togglePending || anyFilePending || filePending.has(path)) return
+    if (hunkPending.has(id) || approved.has(path) || approvedHunks.has(id)) return
+    if (hunkStates.get(id) === 'undone') return
+    setHunkPending(current => new Set(current).add(id))
+    void applyChanges({ action: 'undo', files: [{ path, diffs: [diff] }] }).then((result) => {
+      const outcome = result.files[0]
+      setHunkStates(current => {
+        const next = new Map(current)
+        if (outcome !== undefined) next.set(id, outcome.state)
+        return next
+      })
+      if (outcome?.state === 'undone') {
+        showToast({
+          tone: 'success',
+          title: t('produced.fileUndone'),
+          files: [],
+        })
+        return
+      }
+      showToast({
+        tone: 'error',
+        title: t('produced.fileUndoFailed'),
+        description: outcome?.reason,
+        files: [{ path }],
+      })
+    }).catch((error: unknown) => {
+      showToast({
+        tone: 'error',
+        title: t('produced.fileUndoFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        files: [],
+      })
+    }).finally(() => {
+      setHunkPending(current => {
+        const next = new Set(current)
+        next.delete(id)
+        return next
+      })
+    })
+  }, [
+    anyFilePending, applyChanges, approved, approvedHunks, filePending, hunkPending,
+    hunkStates, reviews, showToast, statusPending, t, togglePending,
+  ])
+
+  /** Refresh per-hunk Host states whenever the drawer focuses one file. */
+  useEffect(() => {
+    if (reviewScope?.kind !== 'file') return
+    const review = reviews.find(item => item.path === reviewScope.path)
+    if (review === undefined || review.diffs.length === 0) return
+    const hunkFiles = review.diffs.map(diff => ({ path: review.path, diffs: [diff] }))
+    let active = true
+    void inspectChanges({ action: 'undo', files: hunkFiles }).then((result) => {
+      if (!active) return
+      setHunkStates(current => {
+        const next = new Map(current)
+        result.files.forEach((file, index) => {
+          if (file !== undefined && file.path === review.path) {
+            next.set(hunkId(review.path, index), file.state)
+          }
+        })
+        return next
+      })
+    }).catch(() => {
+      // Unknown hunk states stay usable; execution re-checks on the Host.
+    })
+    return () => { active = false }
+  }, [inspectChanges, reviewScope, reviews])
 
   const openReview = useCallback((scope: ReviewScope, trigger: HTMLButtonElement) => {
     if (!claimReviewDrawer(reviewOwnerRef.current)) return
@@ -471,6 +746,20 @@ export function ProducedFiles({
       document.removeEventListener('keydown', onKeyDown)
       triggerRef.current?.focus()
     }
+  }, [closeReview, reviewScope])
+
+  /** Close the drawer when pressing anywhere outside it (or its opener). */
+  useEffect(() => {
+    if (reviewScope === null) return
+    const onPointerDown = (event: PointerEvent): void => {
+      const target = event.target as Node | null
+      if (target === null) return
+      if (drawerRef.current?.contains(target)) return
+      if (triggerRef.current?.contains(target)) return
+      closeReview()
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => { document.removeEventListener('pointerdown', onPointerDown) }
   }, [closeReview, reviewScope])
 
   useEffect(() => () => {
@@ -654,58 +943,104 @@ export function ProducedFiles({
           <button
             type="button"
             className={css.toggleButton}
-            disabled={statusPending || togglePending || !hasReversibleFiles}
-            title={!hasReversibleFiles ? t('produced.toggleUnavailable') : undefined}
-            aria-label={toggleAction === 'undo' ? t('produced.undo') : t('produced.redo')}
-            onClick={runToggle}
+            disabled={statusPending || togglePending || anyFilePending || allApproved}
+            aria-label={t('produced.approveAll')}
+            title={t('produced.approveAll')}
+            onClick={approveAll}
           >
-            {togglePending
-              ? (toggleAction === 'undo' ? t('produced.undoing') : t('produced.redoing'))
-              : (toggleAction === 'undo' ? t('produced.undo') : t('produced.redo'))}
+            <ApproveAllIcon />
           </button>
           <button
             type="button"
-            className={css.reviewButton}
-            aria-label={t('produced.reviewAll')}
-            onClick={event => { openReview({ kind: 'all' }, event.currentTarget) }}
+            className={css.toggleButton}
+            disabled={statusPending || togglePending || anyFilePending || !hasUndoableFiles}
+            title={!statusPending && !hasUndoableFiles
+              ? t('produced.toggleUnavailable')
+              : t('produced.undoAll')}
+            aria-label={t('produced.undoAll')}
+            onClick={runUndoAll}
           >
-            <ReviewIcon />
-            {t('review.title')}
+            {togglePending ? <LoaderIcon /> : <UndoAllIcon />}
           </button>
         </header>
         <div className={css.fileList}>
-          {shown.map(({ review, stats }) => (
+          {shown.map(({ review, stats }) => {
+            const pending = filePending.has(review.path)
+            const isApproved = approved.has(review.path)
+            const undoDisabled = statusPending || togglePending || anyFilePending || pending
+              || !undoablePaths.has(review.path)
+            const undoTitle = statusPending ? undefined : undoTitleFor(review.path)
+            return (
+              <div key={review.path} className={css.fileRow} title={review.path}>
+                <button
+                  type="button"
+                  className={css.fileRowOpen}
+                  aria-label={t('produced.review', { name: review.path })}
+                  onClick={event => {
+                    openReview({ kind: 'file', path: review.path }, event.currentTarget)
+                  }}
+                >
+                  <span className={css.fileName}>{basename(review.path)}</span>
+                  {review.sources !== undefined && review.sources.length > 0 && (
+                    <span
+                      className={css.fileSources}
+                      aria-label={t('produced.sources', { names: review.sources.join(', ') })}
+                    >
+                      {review.sources.map(source => (
+                        <span key={source} className={css.fileSource}>{source}</span>
+                      ))}
+                    </span>
+                  )}
+                  <Stats
+                    stats={stats}
+                    label={t('review.stats', {
+                      added: String(stats.added), removed: String(stats.removed),
+                    })}
+                  />
+                </button>
+                <button
+                  type="button"
+                  className={`${css.fileApprove} ${isApproved ? css.fileApproveApproved : ''}`}
+                  disabled={statusPending || togglePending || anyFilePending || isApproved}
+                  aria-label={t('produced.approveFile', { name: review.path })}
+                  title={isApproved ? t('produced.approved') : t('produced.approve')}
+                  onClick={() => { approveFile(review.path) }}
+                >
+                  <ApproveIcon />
+                </button>
+                <button
+                  type="button"
+                  className={css.fileToggle}
+                  disabled={undoDisabled}
+                  title={undoTitle ?? t('produced.undo')}
+                  aria-label={t('produced.undoFile', { name: review.path })}
+                  onClick={() => { runFileUndo(review.path) }}
+                >
+                  {pending ? <LoaderIcon /> : <UndoIcon />}
+                </button>
+              </div>
+            )
+          })}
+          {(hidden > 0 || expanded) && (
             <button
-              key={review.path}
               type="button"
-              className={css.fileRow}
-              title={review.path}
-              aria-label={t('produced.review', { name: review.path })}
-              onClick={event => {
-                openReview({ kind: 'file', path: review.path }, event.currentTarget)
-              }}
+              className={css.moreFiles}
+              aria-expanded={expanded}
+              onClick={() => { setExpanded(current => !current) }}
             >
-              <span className={css.fileName}>{basename(review.path)}</span>
-              <Stats
-                stats={stats}
-                label={t('review.stats', {
-                  added: String(stats.added), removed: String(stats.removed),
-                })}
-              />
+              {expanded
+                ? t('produced.collapse')
+                : (hidden === 1
+                  ? t('produced.moreOne')
+                  : t('produced.more', { count: String(hidden) }))}
             </button>
-          ))}
-          {hidden > 0 && (
-            <div className={css.moreFiles}>
-              {hidden === 1
-                ? t('produced.moreOne')
-                : t('produced.more', { count: String(hidden) })}
-            </div>
           )}
         </div>
       </section>
 
-      {reviewScope !== null && (
+      {reviewScope !== null && createPortal(
         <aside
+          ref={drawerRef}
           className={`${css.drawer} ${isHostSplit ? css.drawerSplit : ''} ${isResizing ? css.drawerResizing : ''}`}
           style={drawerStyle}
           role="dialog"
@@ -759,6 +1094,7 @@ export function ProducedFiles({
               type="button"
               className={css.closeButton}
               aria-label={t('review.close')}
+              title={t('review.closeHint')}
               onClick={closeReview}
             >
               <CloseIcon />
@@ -773,12 +1109,43 @@ export function ProducedFiles({
                   <header className={css.reviewFileHeader}>
                     <span className={css.reviewStatus}>M</span>
                     <span className={css.reviewPath} title={relativePath}>{relativePath}</span>
+                    {review.sources !== undefined && review.sources.length > 0 && (
+                      <span
+                        className={css.fileSources}
+                        aria-label={t('produced.sources', { names: review.sources.join(', ') })}
+                      >
+                        {review.sources.map(source => (
+                          <span key={source} className={css.fileSource}>{source}</span>
+                        ))}
+                      </span>
+                    )}
                     <Stats
                       stats={stats}
                       label={t('review.stats', {
                         added: String(stats.added), removed: String(stats.removed),
                       })}
                     />
+                    <button
+                      type="button"
+                      className={`${css.fileApprove} ${approved.has(review.path) ? css.fileApproveApproved : ''}`}
+                      disabled={statusPending || togglePending || anyFilePending || approved.has(review.path)}
+                      aria-label={t('produced.approveFile', { name: review.path })}
+                      title={approved.has(review.path) ? t('produced.approved') : t('produced.approve')}
+                      onClick={() => { approveFile(review.path) }}
+                    >
+                      <ApproveIcon />
+                    </button>
+                    <button
+                      type="button"
+                      className={css.fileToggle}
+                      disabled={statusPending || togglePending || anyFilePending
+                        || filePending.has(review.path) || !undoablePaths.has(review.path)}
+                      title={(statusPending ? undefined : undoTitleFor(review.path)) ?? t('produced.undo')}
+                      aria-label={t('produced.undoFile', { name: review.path })}
+                      onClick={() => { runFileUndo(review.path) }}
+                    >
+                      {filePending.has(review.path) ? <LoaderIcon /> : <UndoIcon />}
+                    </button>
                     <button
                       type="button"
                       className={css.openButton}
@@ -790,25 +1157,79 @@ export function ProducedFiles({
                   {review.diffs.length === 0
                     ? <p className={css.reviewUnavailable}>{t('review.unavailable')}</p>
                     : (
-                      <UnifiedDiff
-                        diffs={review.diffs}
-                        contextLines={3}
-                        showCopyButton={false}
-                        showFileHeaders={false}
-                        labels={{
-                          copy: t('review.copy'),
-                          copied: t('review.copied'),
-                          showUnchanged: count => t('review.showUnchanged', { count: String(count) }),
-                          hideUnchanged: count => t('review.hideUnchanged', { count: String(count) }),
-                        }}
-                        className={css.reviewDiff}
-                      />
+                      <div className={css.hunkList}>
+                        {review.diffs.map((diff, index) => {
+                          const id = hunkId(review.path, index)
+                          const hState = hunkStates.get(id)
+                          const hApproved = approved.has(review.path) || approvedHunks.has(id)
+                          const hPending = hunkPending.has(id)
+                          const hReversible = hunkReversible(review.path, diff)
+                          const hBlocked = hState === 'conflict' || hState === 'error'
+                          const hUndoDisabled = statusPending || togglePending || anyFilePending
+                            || hPending || filePending.has(review.path) || !hReversible
+                            || hApproved || hState === 'undone' || hBlocked
+                          const hUndoTitle = !hReversible
+                            ? (diff.oldText === null
+                              ? t('produced.hunkCreated')
+                              : t('produced.toggleUnavailable'))
+                            : hApproved
+                              ? t('produced.hunkApprovedLocked')
+                              : hState === 'undone'
+                                ? t('produced.hunkAlreadyUndone')
+                                : hBlocked
+                                  ? t('produced.fileToggleBlocked')
+                                  : undefined
+                          return (
+                            <div key={id} className={css.hunkBlock}>
+                              <div className={css.hunkToolbar}>
+                                <span className={css.hunkLabel}>
+                                  @@ -{diff.oldStart ?? 1} +{diff.newStart ?? 1} @@
+                                </span>
+                                <button
+                                  type="button"
+                                  className={`${css.fileApprove} ${hApproved ? css.fileApproveApproved : ''}`}
+                                  disabled={statusPending || togglePending || anyFilePending || hApproved}
+                                  aria-label={t('produced.approveHunk')}
+                                  title={hApproved ? t('produced.approved') : t('produced.approveHunk')}
+                                  onClick={() => { approveHunk(review.path, index) }}
+                                >
+                                  <ApproveIcon />
+                                </button>
+                                <button
+                                  type="button"
+                                  className={css.fileToggle}
+                                  disabled={hUndoDisabled}
+                                  title={(statusPending ? undefined : hUndoTitle) ?? t('produced.undoHunk')}
+                                  aria-label={t('produced.undoHunk')}
+                                  onClick={() => { runHunkUndo(review.path, index) }}
+                                >
+                                  {hPending ? <LoaderIcon /> : <UndoIcon />}
+                                </button>
+                              </div>
+                              <UnifiedDiff
+                                diffs={[diff]}
+                                contextLines={3}
+                                showCopyButton={false}
+                                showFileHeaders={false}
+                                labels={{
+                                  copy: t('review.copy'),
+                                  copied: t('review.copied'),
+                                  showUnchanged: count => t('review.showUnchanged', { count: String(count) }),
+                                  hideUnchanged: count => t('review.hideUnchanged', { count: String(count) }),
+                                }}
+                                className={css.reviewDiff}
+                              />
+                            </div>
+                          )
+                        })}
+                      </div>
                     )}
                 </section>
               )
             })}
           </div>
-        </aside>
+        </aside>,
+        document.body,
       )}
       {toast !== null && (
         <ResultToast

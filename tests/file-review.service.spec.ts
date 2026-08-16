@@ -64,6 +64,96 @@ describe('Host file-review change engine', () => {
     expect(transformFile('before before', file, 'redo')).toBeNull()
   })
 
+  it('locates inline fragments inside the recorded line and falls back to a unique match', () => {
+    const inline = {
+      path: 'app.ts',
+      diffs: [{ path: 'app.ts', oldText: 'foo', newText: 'bar', oldStart: 2, newStart: 2 }],
+    }
+    // The source is mid-line, so the recorded line does not start with it;
+    // the inline-fragment match must find it inside the line.
+    expect(transformFile('a\nhello foo world\nc\n', inline, 'redo'))
+      .toBe('a\nhello bar world\nc\n')
+    expect(transformFile('a\nhello bar world\nc\n', inline, 'undo'))
+      .toBe('a\nhello foo world\nc\n')
+    // A wrong recorded line still resolves through the unique full-text match.
+    const offByOne = {
+      path: 'app.ts',
+      diffs: [{ path: 'app.ts', oldText: 'uniqueToken', newText: 'changed', oldStart: 9, newStart: 9 }],
+    }
+    expect(transformFile('x\nuniqueToken\ny\n', offByOne, 'redo'))
+      .toBe('x\nchanged\ny\n')
+    // Ambiguity is still refused: two occurrences cannot be disambiguated.
+    const ambiguous = {
+      path: 'app.ts',
+      diffs: [{ path: 'app.ts', oldText: 'token', newText: 'changed', oldStart: 9, newStart: 9 }],
+    }
+    expect(transformFile('token token\n', ambiguous, 'redo')).toBeNull()
+  })
+
+  it('reports inline-fragment edits as applied and undoes them', async () => {
+    const root = await workspace()
+    const filename = join(root, 'app.ts')
+    await writeFile(filename, 'a\nhello bar world\nc\n')
+    const edit: FileReviewChange = {
+      path: 'app.ts',
+      diffs: [{ path: 'app.ts', oldText: 'foo', newText: 'bar', oldStart: 2, newStart: 2 }],
+    }
+    const agent = fakeAgent(root)
+    expect((await status(agent, { action: 'undo', files: [edit] })).files[0].state)
+      .toBe('applied')
+    expect((await applyChange(agent, { action: 'undo', files: [edit] })).files[0].state)
+      .toBe('undone')
+    expect(await readFile(filename, 'utf8')).toBe('a\nhello foo world\nc\n')
+    expect((await applyChange(agent, { action: 'redo', files: [edit] })).files[0].state)
+      .toBe('applied')
+    expect(await readFile(filename, 'utf8')).toBe('a\nhello bar world\nc\n')
+  })
+
+  it('undoes str_replace_editor insert hunks (old text is an empty anchor)', async () => {
+    // str_replace_editor's `insert` produces oldText "" anchored at the line
+    // after insert_line; undo deletes the inserted text, redo re-inserts it.
+    const insert = {
+      path: 'notes.txt',
+      diffs: [{ path: 'notes.txt', oldText: '', newText: 'X\n', oldStart: 2, newStart: 2 }],
+    }
+    expect(transformFile('a\nb\nc\n', insert, 'redo')).toBe('a\nX\nb\nc\n')
+    expect(transformFile('a\nX\nb\nc\n', insert, 'undo')).toBe('a\nb\nc\n')
+
+    const root = await workspace()
+    const filename = join(root, 'notes.txt')
+    await writeFile(filename, 'a\nX\nb\nc\n')
+    const agent = fakeAgent(root)
+    expect((await status(agent, { action: 'undo', files: [insert] })).files[0].state)
+      .toBe('applied')
+    expect((await applyChange(agent, { action: 'undo', files: [insert] })).files[0].state)
+      .toBe('undone')
+    expect(await readFile(filename, 'utf8')).toBe('a\nb\nc\n')
+    // Already-undone files read as undone instead of a false conflict.
+    expect((await status(agent, { action: 'undo', files: [insert] })).files[0].state)
+      .toBe('undone')
+  })
+
+  it('resolves LF-recorded hunks against CRLF files', async () => {
+    // `edit`-style diffs carry LF text with no line numbers; a CRLF file on
+    // disk must still match through the CRLF spelling of the hunk.
+    const edit = {
+      path: 'app.ts',
+      diffs: [{ path: 'app.ts', oldText: 'a\nb', newText: 'a\nc' }],
+    }
+    expect(transformFile('a\r\nc\r\nx\r\n', edit, 'undo')).toBe('a\r\nb\r\nx\r\n')
+    expect(transformFile('a\r\nb\r\nx\r\n', edit, 'redo')).toBe('a\r\nc\r\nx\r\n')
+
+    const root = await workspace()
+    const filename = join(root, 'app.ts')
+    await writeFile(filename, 'a\r\nc\r\nx\r\n')
+    const agent = fakeAgent(root)
+    expect((await status(agent, { action: 'undo', files: [edit] })).files[0].state)
+      .toBe('applied')
+    expect((await applyChange(agent, { action: 'undo', files: [edit] })).files[0].state)
+      .toBe('undone')
+    expect(await readFile(filename, 'utf8')).toBe('a\r\nb\r\nx\r\n')
+  })
+
   it('changes safe files independently while skipping conflicts and unsupported diffs', async () => {
     const root = await workspace()
     await writeFile(join(root, 'a.txt'), 'A')
@@ -83,14 +173,20 @@ describe('Host file-review change engine', () => {
     expect(result.files).toEqual([
       { path: 'a.txt', state: 'undone', changed: true },
       expect.objectContaining({ path: 'b.txt', state: 'conflict', changed: false }),
-      expect.objectContaining({ path: 'created.txt', state: 'unsupported', changed: false }),
+      // A created file whose content matches is deleted by undo.
+      { path: 'created.txt', state: 'undone', changed: true },
     ])
     expect(await readFile(join(root, 'a.txt'), 'utf8')).toBe('a')
     expect(await readFile(join(root, 'b.txt'), 'utf8')).toBe('someone else changed this')
+    await expect(readFile(join(root, 'created.txt'), 'utf8')).rejects.toThrow()
 
     const redone = await applyChange(agent, { ...request, action: 'redo' })
     expect(redone.files[0]).toEqual({ path: 'a.txt', state: 'applied', changed: true })
     expect(await readFile(join(root, 'a.txt'), 'utf8')).toBe('A')
+    // A deleted created file cannot be recreated.
+    expect(redone.files[2]).toEqual(expect.objectContaining({
+      path: 'created.txt', state: 'unsupported', changed: false,
+    }))
   })
 
   it('derives applied, undone, conflict, and unsupported status from disk', async () => {
@@ -99,6 +195,7 @@ describe('Host file-review change engine', () => {
     await writeFile(join(root, 'undone.txt'), 'old')
     await writeFile(join(root, 'conflict.txt'), 'other')
     await writeFile(join(root, 'unknown.txt'), 'new')
+    await writeFile(join(root, 'noop.txt'), 'x')
     const result = await status(fakeAgent(root), {
       action: 'undo',
       files: [
@@ -106,10 +203,11 @@ describe('Host file-review change engine', () => {
         change('undone.txt', 'old', 'new'),
         change('conflict.txt', 'old', 'new'),
         change('unknown.txt', null, 'new'),
+        change('noop.txt', 'x', 'x'),
       ],
     })
     expect(result.files.map(file => file.state))
-      .toEqual(['applied', 'undone', 'conflict', 'unsupported'])
+      .toEqual(['applied', 'undone', 'conflict', 'applied', 'unsupported'])
   })
 
   it('rejects paths outside the workspace and symbolic links', async () => {
@@ -126,6 +224,62 @@ describe('Host file-review change engine', () => {
     ])
   })
 
+  it('deletes a created file on undo and reports it undone when missing', async () => {
+    const root = await workspace()
+    const filename = join(root, 'created.txt')
+    await writeFile(filename, 'hello')
+    const agent = fakeAgent(root)
+    const created = change('created.txt', null, 'hello')
+
+    // Present and matching → applied; undo deletes it.
+    expect((await status(agent, { action: 'undo', files: [created] })).files[0])
+      .toEqual({ path: 'created.txt', state: 'applied', changed: false })
+    expect((await applyChange(agent, { action: 'undo', files: [created] })).files[0])
+      .toEqual({ path: 'created.txt', state: 'undone', changed: true })
+    await expect(readFile(filename, 'utf8')).rejects.toThrow()
+    // Missing → undone; a repeated undo is an idempotent no-op.
+    expect((await status(agent, { action: 'undo', files: [created] })).files[0])
+      .toEqual({ path: 'created.txt', state: 'undone', changed: false })
+    expect((await applyChange(agent, { action: 'undo', files: [created] })).files[0])
+      .toEqual({ path: 'created.txt', state: 'undone', changed: false })
+    // Redo cannot recreate a deleted file.
+    expect((await applyChange(agent, { action: 'redo', files: [created] })).files[0])
+      .toEqual(expect.objectContaining({ path: 'created.txt', state: 'unsupported', changed: false }))
+  })
+
+  it('refuses to delete a created file whose content changed after the turn', async () => {
+    const root = await workspace()
+    const filename = join(root, 'created.txt')
+    await writeFile(filename, 'modified by hand')
+    const result = await applyChange(fakeAgent(root), {
+      action: 'undo', files: [change('created.txt', null, 'original')],
+    })
+    expect(result.files[0]).toEqual(expect.objectContaining({
+      path: 'created.txt', state: 'conflict', changed: false,
+    }))
+    expect(await readFile(filename, 'utf8')).toBe('modified by hand')
+  })
+
+  it('deletes a created file only when the full recorded change matches', async () => {
+    // Created and then edited in one turn: the safe-delete check replays the
+    // creation and later edits to derive the exact expected content.
+    const root = await workspace()
+    const filename = join(root, 'notes.txt')
+    await writeFile(filename, 'a\nB\nc\n')
+    const file: FileReviewChange = {
+      path: 'notes.txt',
+      diffs: [
+        { path: 'notes.txt', oldText: null, newText: 'a\nb\nc\n' },
+        { path: 'notes.txt', oldText: 'b', newText: 'B', oldStart: 2, newStart: 2 },
+      ],
+    }
+    expect((await status(fakeAgent(root), { action: 'undo', files: [file] })).files[0])
+      .toEqual({ path: 'notes.txt', state: 'applied', changed: false })
+    expect((await applyChange(fakeAgent(root), { action: 'undo', files: [file] })).files[0])
+      .toEqual({ path: 'notes.txt', state: 'undone', changed: true })
+    await expect(readFile(filename, 'utf8')).rejects.toThrow()
+  })
+
   it('preserves file permissions across atomic replacement', async () => {
     const root = await workspace()
     const filename = join(root, 'script.sh')
@@ -135,7 +289,11 @@ describe('Host file-review change engine', () => {
       action: 'undo', files: [change('script.sh', 'OLD', 'NEW')],
     })
     expect(await readFile(filename, 'utf8')).toBe('OLD')
-    expect((await lstat(filename)).mode & 0o777).toBe(0o640)
+    // Windows has no POSIX permission bits (`chmod` is a no-op there), so the
+    // mode-preservation assertion is meaningful on POSIX systems only.
+    if (process.platform !== 'win32') {
+      expect((await lstat(filename)).mode & 0o777).toBe(0o640)
+    }
   })
 
   it('reports non-UTF-8 files and rejects sessions without a workspace', async () => {

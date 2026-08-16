@@ -16,6 +16,8 @@ interface ProducedPath {
   readonly seq: number
   readonly path: string
   readonly diffs: readonly ProducedFileDiff[]
+  /** Which tool command produced this entry, e.g. `insert`, `str_replace`. */
+  readonly source?: string | undefined
 }
 
 /** Immutable produced-file facts published against one Turn. */
@@ -33,6 +35,56 @@ declare module '@deepseek-ai/dsh-client-runtime/client' {
 interface DeliverablesState extends DeliverablesTurnData {
   readonly turn: number
   readonly calls: ReadonlyMap<string, ToolResultNode['callView']>
+  /** Insert diffs reconstructed from tool-call arguments, keyed by callId. */
+  readonly inserts: ReadonlyMap<string, readonly ProducedFileDiff[]>
+  /** Human source label (tool command) per callId. */
+  readonly callSources: ReadonlyMap<string, string>
+}
+
+/**
+ * A short source label for a mutation call: the `str_replace_editor` command
+ * name, or the tool name for every other tool.
+ */
+function callSourceLabel(name: string, argsJson: string): string | null {
+  if (name === 'str_replace_editor') {
+    try {
+      const args = JSON.parse(argsJson) as { command?: unknown }
+      return typeof args.command === 'string' && args.command !== '' ? args.command : null
+    } catch {
+      return null
+    }
+  }
+  return name
+}
+
+/**
+ * Reconstruct a reversible diff for `str_replace_editor`'s `insert` command.
+ * Its result view is a generic `edit` card with no `diffs`, so the change is
+ * recovered from the call arguments: inserting `new_str` after `insert_line`
+ * is undone by locating and deleting that text at line `insert_line + 1`.
+ */
+function insertDiffsFromCall(name: string, argsJson: string): readonly ProducedFileDiff[] {
+  if (name !== 'str_replace_editor') return []
+  let args: Record<string, unknown>
+  try {
+    args = JSON.parse(argsJson) as Record<string, unknown>
+  } catch {
+    return []
+  }
+  if (args?.command !== 'insert') return []
+  const path = typeof args.path === 'string' ? args.path : null
+  const newText = typeof args.new_str === 'string' ? args.new_str : null
+  const insertLine = typeof args.insert_line === 'number' && Number.isInteger(args.insert_line)
+    ? args.insert_line + 1
+    : undefined
+  if (path === null || newText === null || newText === '' || insertLine === undefined) return []
+  return [{
+    path,
+    oldText: '',
+    newText,
+    oldStart: insertLine,
+    newStart: insertLine,
+  }]
 }
 
 /**
@@ -87,12 +139,14 @@ function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
   return diffs
 }
 
-/** Applied result hunks, or successful-call intent only when no result view exists. */
+/** Applied result hunks, falling back to the call intent when the result
+ * view carries no reconstructable hunks. */
 function reviewDiffs(
   callView: ToolResultNode['callView'],
   resultView: ConversationMatch['view'],
 ): readonly ProducedFileDiff[] {
-  if (resultView?.for === 'result') return producedDiffs(resultView.view)
+  const resultDiffs = resultView?.for === 'result' ? producedDiffs(resultView.view) : []
+  if (resultDiffs.length > 0) return resultDiffs
   return producedDiffs(callView)
 }
 
@@ -107,17 +161,24 @@ export function reviewsForClosing(
   seq = Number.POSITIVE_INFINITY,
 ): readonly ProducedFileReview[] {
   if (data === undefined) return []
-  const reviews: Array<{ path: string; diffs: ProducedFileDiff[] }> = []
-  const byPath = new Map<string, { path: string; diffs: ProducedFileDiff[] }>()
+  const reviews: Array<{ path: string; diffs: ProducedFileDiff[]; sources?: string[] }> = []
+  const byPath = new Map<string, { path: string; diffs: ProducedFileDiff[]; sources?: string[] }>()
   for (const produced of data.produced) {
     if (produced.seq > seq) continue
     const review = byPath.get(produced.path)
     if (review === undefined) {
-      const created = { path: produced.path, diffs: [...produced.diffs] }
+      const created: { path: string; diffs: ProducedFileDiff[]; sources?: string[] } = {
+        path: produced.path,
+        diffs: [...produced.diffs],
+      }
+      if (produced.source !== undefined) created.sources = [produced.source]
       byPath.set(produced.path, created)
       reviews.push(created)
     } else {
       review.diffs.push(...produced.diffs)
+      if (produced.source !== undefined && !review.sources?.includes(produced.source)) {
+        review.sources = [...(review.sources ?? []), produced.source]
+      }
     }
   }
   return reviews
@@ -182,7 +243,10 @@ export const deliverablesDefinition: ConversationNodeDefinition<DeliverablesStat
   },
   start: (_context, match) => {
     if (match.event.type !== 'turn/start') throw new Error('deliverables start requires turn/start')
-    return { turn: match.event.data.turn, calls: new Map(), produced: [] }
+    return {
+      turn: match.event.data.turn, calls: new Map(), inserts: new Map(),
+      callSources: new Map(), produced: [],
+    }
   },
   update: (context, match) => {
     if (match.event.type === 'tool/call') {
@@ -191,17 +255,42 @@ export const deliverablesDefinition: ConversationNodeDefinition<DeliverablesStat
         String(match.event.data.callId),
         match.view?.for === 'call' ? match.view.view : null,
       )
-      return { ...context.state, calls }
+      const inserts = new Map(context.state.inserts)
+      const callSources = new Map(context.state.callSources)
+      // The conversation event carries the raw call arguments as `argsRaw`
+      // (the runtime maps ToolCallBlock.arguments to argsRaw); `arguments`
+      // is only the fixture spelling, kept for robustness.
+      const data = match.event.data as {
+        name?: unknown
+        argsRaw?: unknown
+        arguments?: unknown
+      }
+      const name = data.name
+      const args = data.argsRaw ?? data.arguments
+      if (typeof name === 'string' && typeof args === 'string') {
+        const insertDiffs = insertDiffsFromCall(name, args)
+        if (insertDiffs.length > 0) inserts.set(String(match.event.data.callId), insertDiffs)
+        const source = callSourceLabel(name, args)
+        if (source !== null) callSources.set(String(match.event.data.callId), source)
+      }
+      return { ...context.state, calls, inserts, callSources }
     }
     if (match.event.type !== 'tool/result') return context.state
     const result = match.event.data.message.content[0]
     if (result.isError === true) return context.state
     const callId = String(match.event.data.message.source.callId)
     const callView = context.state.calls.get(callId) ?? null
-    const diffs = reviewDiffs(callView, match.view)
+    let diffs = reviewDiffs(callView, match.view)
+    if (diffs.length === 0) {
+      // The result carries no reconstructable hunks (generic `insert` cards);
+      // fall back to the diff rebuilt from the call arguments.
+      diffs = context.state.inserts.get(callId) ?? []
+    }
+    const source = context.state.callSources.get(callId)
     const additions = producedPaths(callView).map(path => ({
       seq: match.event.seq,
       path,
+      source,
       diffs: diffs.filter(diff => diff.path === path),
     }))
     return additions.length === 0

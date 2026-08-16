@@ -9,6 +9,7 @@ const CSS_VIRTUAL_SUFFIX = '.mjs'
 const CLIENT_EXTERNALS = [
   'react',
   'react/jsx-runtime',
+  'react-dom',
 ] as const
 
 /** Compile CSS Modules into package-owned style elements understood by the Web plugin loader. */

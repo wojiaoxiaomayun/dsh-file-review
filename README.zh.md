@@ -10,7 +10,7 @@
 [![GitHub repository](https://img.shields.io/badge/GitHub-Repository-181717?logo=github)](https://github.com/left0ver/dsh-file-review)
 [![MIT License](https://img.shields.io/badge/license-MIT-22c55e)](LICENSE)
 
-[English](README.md) · 简体中文
+[English](README.md) · 简体中文 · [Français](README.fr.md)
 
 </div>
 
