@@ -2,3 +2,5 @@ node_modules
 .pnpm-store
 lib
 *.tgz
+
+.dsh-vision-toolkit

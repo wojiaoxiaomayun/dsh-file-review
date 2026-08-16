@@ -170,20 +170,24 @@
   min-height: 38px;
   align-items: center;
   gap: 8px;
-  padding: 0 8px 0 12px;
+  padding: 0 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
 }
 
+/* The hover highlight is an inset rounded pill: the row's own 8px padding
+   and the button's horizontal padding keep the highlight and its text away
+   from the card edges instead of painting a full-bleed band. */
 .fileRowOpen {
   display: flex;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 38px;
+  min-height: 34px;
   align-items: center;
   gap: 12px;
-  margin: 0;
-  padding: 0;
+  margin: 2px 8px;
+  padding: 0 10px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
@@ -264,11 +268,12 @@
 
 .moreFiles {
   display: block;
-  width: 100%;
+  width: calc(100% - 32px);
   min-height: 34px;
-  margin: 0;
-  padding: 0 12px;
+  margin: 2px 16px;
+  padding: 0 10px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
   color: var(--dsw-alias-label-tertiary);
   cursor: pointer;
