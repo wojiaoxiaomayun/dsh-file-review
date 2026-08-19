@@ -6,7 +6,7 @@
 
 ![DeepSeek Harness 0.1.x](https://img.shields.io/badge/DeepSeek%20Harness-0.1.x-4f46e5)
 ![Web profile](https://img.shields.io/badge/profile-Web-0ea5e9)
-[![npm version](https://img.shields.io/npm/v/dsh-file-review.svg)](https://www.npmjs.com/package/dsh-file-review)
+[![npm version](https://img.shields.io/npm/v/@dsh-xhl/dsh-file-review.svg)](https://www.npmjs.com/package/@dsh-xhl/dsh-file-review)
 [![GitHub repository](https://img.shields.io/badge/GitHub-Repository-181717?logo=github)](https://github.com/left0ver/dsh-file-review)
 [![MIT License](https://img.shields.io/badge/license-MIT-22c55e)](LICENSE)
 
@@ -29,18 +29,18 @@
 
 ## 快速开始
 
-### 0. 将dsh-file-review添加到pnpm冷静期白名单
+### 0. 将@dsh-xhl/dsh-file-review添加到pnpm冷静期白名单
 找到`~/.dsh/profiles/web/pnpm-workspace.yaml`,加上
 
 ```yaml
 minimumReleaseAgeExclude:
-  - dsh-file-review
+  - '@dsh-xhl/dsh-file-review'
 ```
-这是因为较新版的`pnpm`有冷静期，默认情况下，新发布的包得过了冷静期之后才会被安装。因此要安装最新版本，需要将`dsh-file-review`加入到名单中。
+这是因为较新版的`pnpm`有冷静期，默认情况下，新发布的包得过了冷静期之后才会被安装。因此要安装最新版本，需要将`@dsh-xhl/dsh-file-review`加入到名单中。
 ### 1. 安装插件
 
 ```sh
-dsh plugin --profile web add dsh-file-review
+dsh plugin --profile web add @dsh-xhl/dsh-file-review
 ```
 
 ### 2. 启动 DSH Web
@@ -71,12 +71,12 @@ dsh plugin --profile web add github:left0ver/dsh-file-review
 ## 更新插件
 
 ```sh
-dsh plugin --profile web update dsh-file-review
+dsh plugin --profile web update @dsh-xhl/dsh-file-review
 ```
 ## 卸载插件
 
 ```sh
-dsh plugin --profile web remove dsh-file-review
+dsh plugin --profile web remove @dsh-xhl/dsh-file-review
 ```
 
 ## 友情链接

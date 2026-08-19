@@ -3,4 +3,4 @@
   
 - insert:
     - id: file-review
-      name: 'dsh-file-review'
+      name: '@dsh-xhl/dsh-file-review'

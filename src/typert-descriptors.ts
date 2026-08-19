@@ -3,7 +3,7 @@
 import { z } from 'zod'
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
 
-export const PACKAGE_NAME = 'dsh-file-review'
+export const PACKAGE_NAME = '@dsh-xhl/dsh-file-review'
 
 const diffSchema = z.object({
   path: z.string(),

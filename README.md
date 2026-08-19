@@ -6,7 +6,7 @@
 
 ![DeepSeek Harness 0.1.x](https://img.shields.io/badge/DeepSeek%20Harness-0.1.x-4f46e5)
 ![Web profile](https://img.shields.io/badge/profile-Web-0ea5e9)
-[![npm version](https://img.shields.io/npm/v/dsh-file-review.svg)](https://www.npmjs.com/package/dsh-file-review)
+[![npm version](https://img.shields.io/npm/v/@dsh-xhl/dsh-file-review.svg)](https://www.npmjs.com/package/@dsh-xhl/dsh-file-review)
 [![GitHub repository](https://img.shields.io/badge/GitHub-Repository-181717?logo=github)](https://github.com/left0ver/dsh-file-review)
 [![MIT License](https://img.shields.io/badge/license-MIT-22c55e)](LICENSE)
 
@@ -31,21 +31,21 @@ English · [简体中文](README.zh.md) · [Français](README.fr.md)
 
 ## Quick start
 
-### 0. Add dsh-file-review in pnpm's minimum release age withlist
+### 0. Add @dsh-xhl/dsh-file-review in pnpm's minimum release age withlist
 
 Open `~/.dsh/profiles/web/pnpm-workspace.yaml` and add:
 
 ```yaml
 minimumReleaseAgeExclude:
-  - dsh-file-review
+  - '@dsh-xhl/dsh-file-review'
 ```
 
-Recent versions of `pnpm` enforce a minimum release age, so newly published packages are not installed until that waiting period has passed. To install the latest version, add `dsh-file-review` to the exclusion list.
+Recent versions of `pnpm` enforce a minimum release age, so newly published packages are not installed until that waiting period has passed. To install the latest version, add `@dsh-xhl/dsh-file-review` to the exclusion list.
 
 ### 1. Install the plugin
 
 ```sh
-dsh plugin --profile web add dsh-file-review
+dsh plugin --profile web add @dsh-xhl/dsh-file-review
 ```
 
 ### 2. Start DSH Web
@@ -75,13 +75,13 @@ dsh plugin --profile web add github:left0ver/dsh-file-review
 ## Update the plugin
 
 ```sh
-dsh plugin --profile web update dsh-file-review
+dsh plugin --profile web update @dsh-xhl/dsh-file-review
 ```
 
 ## Uninstall the plugin
 
 ```sh
-dsh plugin --profile web remove dsh-file-review
+dsh plugin --profile web remove @dsh-xhl/dsh-file-review
 ```
 
 ## Friendly Links

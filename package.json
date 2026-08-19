@@ -1,5 +1,5 @@
 {
-  "name": "dsh-file-review",
+  "name": "@dsh-xhl/dsh-file-review",
   "description": "Review files produced by DeepSeek Harness turns in a line-numbered unified diff drawer",
   "version": "0.3.1",
   "keywords": [
@@ -54,7 +54,8 @@
     "assests/preview.png"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   },
   "dsh": {
     "bundle": {

@@ -6,7 +6,7 @@
 
 ![DeepSeek Harness 0.1.x](https://img.shields.io/badge/DeepSeek%20Harness-0.1.x-4f46e5)
 ![Web profile](https://img.shields.io/badge/profile-Web-0ea5e9)
-[![npm version](https://img.shields.io/npm/v/dsh-file-review.svg)](https://www.npmjs.com/package/dsh-file-review)
+[![npm version](https://img.shields.io/npm/v/@dsh-xhl/dsh-file-review.svg)](https://www.npmjs.com/package/@dsh-xhl/dsh-file-review)
 [![GitHub repository](https://img.shields.io/badge/GitHub-Repository-181717?logo=github)](https://github.com/left0ver/dsh-file-review)
 [![MIT License](https://img.shields.io/badge/license-MIT-22c55e)](LICENSE)
 
@@ -31,21 +31,21 @@
 
 ## Démarrage rapide
 
-### 0. Ajouter dsh-file-review à la liste blanche de l'âge minimum de publication de pnpm
+### 0. Ajouter @dsh-xhl/dsh-file-review à la liste blanche de l'âge minimum de publication de pnpm
 
 Ouvrez `~/.dsh/profiles/web/pnpm-workspace.yaml` et ajoutez :
 
 ```yaml
 minimumReleaseAgeExclude:
-  - dsh-file-review
+  - '@dsh-xhl/dsh-file-review'
 ```
 
-Les versions récentes de `pnpm` imposent un âge minimum de publication : les paquets récemment publiés ne sont pas installés tant que cette période d'attente n'est pas écoulée. Pour installer la dernière version, ajoutez `dsh-file-review` à la liste d'exclusion.
+Les versions récentes de `pnpm` imposent un âge minimum de publication : les paquets récemment publiés ne sont pas installés tant que cette période d'attente n'est pas écoulée. Pour installer la dernière version, ajoutez `@dsh-xhl/dsh-file-review` à la liste d'exclusion.
 
 ### 1. Installer le plugin
 
 ```sh
-dsh plugin --profile web add dsh-file-review
+dsh plugin --profile web add @dsh-xhl/dsh-file-review
 ```
 
 ### 2. Démarrer DSH Web
@@ -75,13 +75,13 @@ dsh plugin --profile web add github:left0ver/dsh-file-review
 ## Mettre à jour le plugin
 
 ```sh
-dsh plugin --profile web update dsh-file-review
+dsh plugin --profile web update @dsh-xhl/dsh-file-review
 ```
 
 ## Désinstaller le plugin
 
 ```sh
-dsh plugin --profile web remove dsh-file-review
+dsh plugin --profile web remove @dsh-xhl/dsh-file-review
 ```
 
 ## Liens amicaux

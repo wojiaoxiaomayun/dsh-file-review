@@ -23,7 +23,7 @@ describe('published browser artifact', () => {
     const artifact = new FileURL('../lib/client.js', import.meta.url)
     await import(/* @vite-ignore */ `${artifact.href}?test=${String(Date.now())}`)
 
-    expect(handoff?.id).toBe('dsh-file-review')
+    expect(handoff?.id).toBe('@dsh-xhl/dsh-file-review')
     const shared: Record<string, unknown> = {
       react: React,
       'react/jsx-runtime': jsxRuntime,
@@ -35,6 +35,6 @@ describe('published browser artifact', () => {
     }) as { apply?: unknown; inject?: unknown } | undefined
     expect(client?.apply).toBeTypeOf('function')
     expect(client?.inject).toEqual(['slots', 'locale', 'conversationEvents', 'remote', 'sessions'])
-    expect(document.querySelectorAll('style[data-plugin="dsh-file-review"]')).toHaveLength(2)
+    expect(document.querySelectorAll('style[data-plugin="@dsh-xhl/dsh-file-review"]')).toHaveLength(2)
   })
 })
