@@ -11,7 +11,13 @@ try {
     env: { ...process.env, npm_config_cache: cache },
   })
   if (result.status !== 0) throw new Error(result.stderr || result.stdout)
-  const [pack] = JSON.parse(result.stdout)
+  // npm >= 12 emits a single object keyed by package name; npm < 12 emitted a
+  // one-element array. Accept both so the check works across npm versions.
+  const parsed = JSON.parse(result.stdout)
+  const pack = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]
+  if (pack === undefined || !Array.isArray(pack.files)) {
+    throw new Error('npm pack returned no readable package manifest')
+  }
   const files = new Set(pack.files.map((entry) => entry.path))
   for (const required of [
     'cordis.patch.yml',
