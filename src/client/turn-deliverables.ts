@@ -1,13 +1,13 @@
 /**
  * Turn-scoped produced-file definition and readers. Client-only and
- * model-free: the vocabulary is the mutation tools' own follow-along
- * `locations`, never the closing prose.
+ * model-free: the vocabulary is the mutation tools' own call arguments and
+ * result metadata, never the closing prose.
  */
 import type {
-  ConversationMatch, ConversationNodeDefinition, ToolResultNode,
-} from '@deepseek-ai/dsh-client-runtime/client'
+  ConversationNodeDefinition,
+} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { ProducedFileDiff, ProducedFileReview } from '../change-types.ts'
 
 export type { ProducedFileDiff, ProducedFileReview } from '../change-types.ts'
@@ -25,26 +25,27 @@ export interface DeliverablesTurnData {
   readonly produced: readonly ProducedPath[]
 }
 
-declare module '@deepseek-ai/dsh-client-runtime/client' {
+declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
   interface ConversationTurnDataMap {
     /** Successful mutation paths accumulated in this Turn. */
     deliverables: DeliverablesTurnData
   }
 }
 
-interface DeliverablesState extends DeliverablesTurnData {
-  readonly turn: number
-  readonly calls: ReadonlyMap<string, ToolResultNode['callView']>
-  /** Insert diffs reconstructed from tool-call arguments, keyed by callId. */
-  readonly inserts: ReadonlyMap<string, readonly ProducedFileDiff[]>
-  /** Human source label (tool command) per callId. */
-  readonly callSources: ReadonlyMap<string, string>
+interface CallEntry {
+  readonly path: string
+  readonly source?: string | undefined
+  /** Argument-derived hunks, used when the settled result carries none. */
+  readonly intended: readonly ProducedFileDiff[]
 }
 
-/**
- * A short source label for a mutation call: the `str_replace_editor` command
- * name, or the tool name for every other tool.
- */
+interface DeliverablesState extends DeliverablesTurnData {
+  readonly turn: number
+  readonly calls: ReadonlyMap<string, CallEntry>
+}
+
+/** A short source label for a mutation call: the `str_replace_editor` command
+ * name, or the tool name for every other tool. */
 function callSourceLabel(name: string, argsJson: string): string | null {
   if (name === 'str_replace_editor') {
     try {
@@ -57,11 +58,83 @@ function callSourceLabel(name: string, argsJson: string): string | null {
   return name
 }
 
+/** Validate one optional line anchor as a positive integer. */
+function lineAnchor(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : undefined
+}
+
+/** Validate diff hunks crossing the Host/browser transport. */
+function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
+  if (typeof view !== 'object' || view === null || Array.isArray(view)) return []
+  const record = view as Record<string, unknown>
+  if (!Array.isArray(record.diffs)) return []
+  const diffs: ProducedFileDiff[] = []
+  for (const value of record.diffs) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
+    const { path, oldText, newText, oldStart, newStart } = value as Record<string, unknown>
+    if (typeof path !== 'string'
+      || (oldText !== null && oldText !== undefined && typeof oldText !== 'string')
+      || typeof newText !== 'string') return []
+    diffs.push({
+      path,
+      oldText: oldText === undefined ? null : oldText,
+      newText,
+      ...(lineAnchor(oldStart) !== undefined ? { oldStart: lineAnchor(oldStart) } : {}),
+      ...(lineAnchor(newStart) !== undefined ? { newStart: lineAnchor(newStart) } : {}),
+    })
+  }
+  return diffs
+}
+
+/**
+ * Argument-derived whole-file or in-place change for a root mutation call.
+ * Mirrors the harness's own diff-card derivation: `write`/`edit` and
+ * `str_replace_editor` `create`/`str_replace` carry one reconstructable hunk
+ * with no line anchors (the Host resolves by unique occurrence).
+ */
+function intendedDiff(name: string, argsJson: string): readonly ProducedFileDiff[] {
+  let args: Record<string, unknown>
+  try {
+    args = JSON.parse(argsJson) as Record<string, unknown>
+  } catch {
+    return []
+  }
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return []
+  if (name === 'str_replace_editor') {
+    const path = typeof args.path === 'string' ? args.path : null
+    if (path === null || path.trim() === '') return []
+    if (args.command === 'create') {
+      const fileText = args.file_text
+      if (fileText !== undefined && typeof fileText !== 'string') return []
+      return [{ path, oldText: null, newText: fileText ?? '' }]
+    }
+    if (args.command === 'str_replace') {
+      const oldText = args.old_str
+      const newText = args.new_str
+      if (oldText !== undefined && typeof oldText !== 'string') return []
+      if (newText !== undefined && typeof newText !== 'string') return []
+      return [{ path, oldText: oldText ?? null, newText: newText ?? '' }]
+    }
+    return []
+  }
+  const path = args.file_path
+  if (typeof path !== 'string' || path.trim() === '') return []
+  if (name === 'write') {
+    const content = args.content
+    return typeof content === 'string' ? [{ path, oldText: null, newText: content }] : []
+  }
+  if (name !== 'edit') return []
+  const oldText = args.old_string
+  const newText = args.new_string
+  if (typeof oldText !== 'string' || typeof newText !== 'string') return []
+  return [{ path, oldText: oldText || null, newText }]
+}
+
 /**
  * Reconstruct a reversible diff for `str_replace_editor`'s `insert` command.
- * Its result view is a generic `edit` card with no `diffs`, so the change is
- * recovered from the call arguments: inserting `new_str` after `insert_line`
- * is undone by locating and deleting that text at line `insert_line + 1`.
+ * Its result carries no `diffs` metadata, so the change is recovered from the
+ * call arguments: inserting `new_str` after `insert_line` is undone by
+ * locating and deleting that text at line `insert_line + 1`.
  */
 function insertDiffsFromCall(name: string, argsJson: string): readonly ProducedFileDiff[] {
   if (name !== 'str_replace_editor') return []
@@ -71,7 +144,8 @@ function insertDiffsFromCall(name: string, argsJson: string): readonly ProducedF
   } catch {
     return []
   }
-  if (args?.command !== 'insert') return []
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return []
+  if (args.command !== 'insert') return []
   const path = typeof args.path === 'string' ? args.path : null
   const newText = typeof args.new_str === 'string' ? args.new_str : null
   const insertLine = typeof args.insert_line === 'number' && Number.isInteger(args.insert_line)
@@ -87,67 +161,22 @@ function insertDiffsFromCall(name: string, argsJson: string): readonly ProducedF
   }]
 }
 
-/**
- * Paths a call view reports having created or changed, by render intent rather
- * than tool name: a diff card, or a generic card whose kind is `edit` (the
- * shape `str_replace_editor`'s insert presents). Every other card produces
- * nothing to open — a read looked, a delete removed, a terminal ran. Only
- * root call views enter this Turn accumulator; nested Code Mode dispatches
- * preserve the pre-assembly behavior and do not contribute independently.
- */
-function producedPaths(view: ToolResultNode['callView']): readonly string[] {
-  if (view === null
-    || (view.card !== 'diff' && !(view.card === 'generic' && view.kind === 'edit'))) return []
-  const locations = (view as { locations?: unknown }).locations
-  if (!Array.isArray(locations)) return []
-  const paths: string[] = []
-  const seen = new Set<string>()
-  for (const location of locations) {
-    if (typeof location !== 'object' || location === null || Array.isArray(location)) continue
-    const path = (location as Record<string, unknown>).path
-    if (typeof path !== 'string' || seen.has(path)) continue
-    seen.add(path)
-    paths.push(path)
-  }
-  return paths
+/** Argument-derived hunks for a mutation call (whole-file, in-place, or insert). */
+function diffsFromCall(name: string, argsJson: string): readonly ProducedFileDiff[] {
+  const inserted = insertDiffsFromCall(name, argsJson)
+  if (inserted.length > 0) return inserted
+  return intendedDiff(name, argsJson)
 }
 
-/** Validate diff hunks crossing the Host/browser transport. */
-function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
-  if (typeof view !== 'object' || view === null || Array.isArray(view)) return []
-  const record = view as Record<string, unknown>
-  if (record.card !== 'diff' || !Array.isArray(record.diffs)) return []
-  const diffs: ProducedFileDiff[] = []
-  for (const value of record.diffs) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
-    const { path, oldText, newText, oldStart, newStart } = value as Record<string, unknown>
-    if (typeof path !== 'string'
-      || (oldText !== null && typeof oldText !== 'string')
-      || typeof newText !== 'string'
-      || (oldStart !== undefined
-        && (typeof oldStart !== 'number' || !Number.isInteger(oldStart) || oldStart < 1))
-      || (newStart !== undefined
-        && (typeof newStart !== 'number' || !Number.isInteger(newStart) || newStart < 1))) return []
-    diffs.push({
-      path,
-      oldText,
-      newText,
-      ...(typeof oldStart === 'number' ? { oldStart } : {}),
-      ...(typeof newStart === 'number' ? { newStart } : {}),
-    })
-  }
-  return diffs
-}
-
-/** Applied result hunks, falling back to the call intent when the result
- * view carries no reconstructable hunks. */
+/** Applied result hunks from `meta.diffs`, or the call intent when the result
+ * carries none. */
 function reviewDiffs(
-  callView: ToolResultNode['callView'],
-  resultView: ConversationMatch['view'],
+  intended: readonly ProducedFileDiff[],
+  meta: unknown,
 ): readonly ProducedFileDiff[] {
-  const resultDiffs = resultView?.for === 'result' ? producedDiffs(resultView.view) : []
-  if (resultDiffs.length > 0) return resultDiffs
-  return producedDiffs(callView)
+  const applied = producedDiffs(meta)
+  if (applied.length > 0) return applied
+  return intended
 }
 
 /**
@@ -187,15 +216,13 @@ export function reviewsForClosing(
 /**
  * Files produced by one Turn data value.
  *
- * The source is the mutation tools' own follow-along `locations`, not the
- * closing prose: a produced file must be listed whether or not the model
- * remembered to name it. A mutation is recognized by render intent, not by
- * tool name — a diff card, or a generic card whose `kind` is `edit` (the shape
- * `str_replace_editor`'s insert presents) — so a new mutation tool joins by
- * declaring what it does. Reads contribute nothing (looking at a file does not
- * produce it), and neither do deletes (there is nothing left to open) or
- * failed calls. Paths keep first-seen order and appear once, so a file written
- * and then edited in the same turn is one entry.
+ * The source is the mutation tools' own call arguments, not the closing
+ * prose: a produced file must be listed whether or not the model remembered
+ * to name it. A mutation is recognized by tool name and arguments, so a new
+ * mutation tool joins by declaring what it does. Reads contribute nothing
+ * (looking at a file does not produce it), and neither do deletes (there is
+ * nothing left to open) or failed calls. Paths keep first-seen order and
+ * appear once, so a file written and then edited in the same turn is one entry.
  *
  * The Conversation Location index owns turn membership before this function
  * runs, so paths cannot spill across turns and this derivation does not infer
@@ -244,67 +271,56 @@ export const deliverablesDefinition: ConversationNodeDefinition<DeliverablesStat
   start: (_context, match) => {
     if (match.event.type !== 'turn/start') throw new Error('deliverables start requires turn/start')
     return {
-      turn: match.event.data.turn, calls: new Map(), inserts: new Map(),
-      callSources: new Map(), produced: [],
+      turn: match.event.data.turn, calls: new Map(), produced: [],
     }
   },
   update: (context, match) => {
     if (match.event.type === 'tool/call') {
       const calls = new Map(context.state.calls)
-      calls.set(
-        String(match.event.data.callId),
-        match.view?.for === 'call' ? match.view.view : null,
-      )
-      const inserts = new Map(context.state.inserts)
-      const callSources = new Map(context.state.callSources)
-      // The conversation event carries the raw call arguments as `argsRaw`
-      // (the runtime maps ToolCallBlock.arguments to argsRaw); `arguments`
-      // is only the fixture spelling, kept for robustness.
-      const data = match.event.data as {
-        name?: unknown
-        argsRaw?: unknown
-        arguments?: unknown
+      const diffs = diffsFromCall(match.event.data.name, match.event.data.arguments)
+      if (diffs.length > 0 && diffs[0] !== undefined) {
+        const source = callSourceLabel(match.event.data.name, match.event.data.arguments)
+        calls.set(String(match.event.data.callId), {
+          path: diffs[0].path,
+          source: source ?? undefined,
+          intended: diffs,
+        })
       }
-      const name = data.name
-      const args = data.argsRaw ?? data.arguments
-      if (typeof name === 'string' && typeof args === 'string') {
-        const insertDiffs = insertDiffsFromCall(name, args)
-        if (insertDiffs.length > 0) inserts.set(String(match.event.data.callId), insertDiffs)
-        const source = callSourceLabel(name, args)
-        if (source !== null) callSources.set(String(match.event.data.callId), source)
-      }
-      return { ...context.state, calls, inserts, callSources }
+      return { ...context.state, calls }
     }
     if (match.event.type !== 'tool/result') return context.state
-    const result = match.event.data.message.content[0]
-    if (result.isError === true) return context.state
+    if (match.event.data.message.content[0].isError === true) return context.state
     const callId = String(match.event.data.message.source.callId)
-    const callView = context.state.calls.get(callId) ?? null
-    let diffs = reviewDiffs(callView, match.view)
-    if (diffs.length === 0) {
-      // The result carries no reconstructable hunks (generic `insert` cards);
-      // fall back to the diff rebuilt from the call arguments.
-      diffs = context.state.inserts.get(callId) ?? []
-    }
-    const source = context.state.callSources.get(callId)
-    const additions = producedPaths(callView).map(path => ({
-      seq: match.event.seq,
-      path,
-      source,
-      diffs: diffs.filter(diff => diff.path === path),
-    }))
+    const entry = context.state.calls.get(callId)
+    if (entry === undefined) return context.state
+    const diffs = reviewDiffs(entry.intended, match.event.data.meta)
+    if (diffs.length === 0) return context.state
+    const additions = diffs
+      .filter(diff => diff.path === entry.path)
+      .map(diff => ({
+        seq: match.event.seq,
+        path: diff.path,
+        source: entry.source,
+        diffs: [diff],
+      }))
     return additions.length === 0
       ? context.state
       : { ...context.state, produced: [...context.state.produced, ...additions] }
   },
-  buildLocationData: (context, scope) => scope !== 'turn' || context.state === undefined
-    ? null
-    : {
+  buildLocationData: (context, scope, previous) => {
+    if (scope !== 'turn' || context.state === undefined) return null
+    const value: DeliverablesTurnData = { produced: context.state.produced }
+    if (previous?.kind === 'turn'
+      && previous.turn === context.state.turn
+      && previous.key === 'deliverables'
+      && previous.value === value) return previous
+    return {
       kind: 'turn',
       turn: context.state.turn,
       key: 'deliverables',
-      value: { produced: context.state.produced },
-    },
+      value,
+    }
+  },
 }
 
 /**

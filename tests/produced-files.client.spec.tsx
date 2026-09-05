@@ -5,13 +5,13 @@
  * and opener wiring, plus the plugin's public service registrations.
  */
 import { act, cleanup, fireEvent, render, within } from '@testing-library/react'
-import { Context, Service } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
-  ConversationEventInput, ConversationLocationDataStore, ConversationMatch,
-  ConversationTurnDataMap, ToolResultNode, TurnLocation,
-} from '@deepseek-ai/dsh-client-runtime/client'
-import type { ChatFileMentions, TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+  ConversationLocationDataStore, ConversationMatch, ConversationStartMatch,
+  ConversationTurnDataMap, TurnLocation,
+} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ChatFileMentions, TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import { ProducedFiles } from '../src/client/ProducedFiles.tsx'
 import { summarizeDiffs, unifiedDiffText } from '../src/client/UnifiedDiff.tsx'
 import {
@@ -81,75 +81,58 @@ function tailOwner(
   return { seq, openFile, turn: turnLocation(turn, data) }
 }
 
-function at(
-  seq: number,
-  type: string,
-  data: unknown,
-  view?: ConversationEventInput['view'],
-): ConversationEventInput {
-  return {
-    event: {
-      seq, time: seq * 1_000, type, data,
-      ...(type === 'tool/result' ? { surfaceOp: 'append' } : {}),
-    } as ConversationEventInput['event'],
-    view,
+function at(seq: number, type: string, data: unknown): SessionEvent {
+  const event = {
+    seq, time: seq * 1_000, type, data,
+    ...(type === 'tool/result' ? { surfaceOp: 'append' as const } : {}),
   }
+  return event as unknown as SessionEvent
 }
 
-function matched(input: ConversationEventInput, role: ConversationMatch['role']): ConversationMatch {
-  return { ...input, role, location: { kind: 'unresolved' } }
+function matched(event: SessionEvent, role: 'start'): ConversationStartMatch
+function matched(event: SessionEvent, role: ConversationMatch['role']): ConversationMatch
+function matched(event: SessionEvent, role: ConversationMatch['role']): ConversationMatch {
+  return { event, role, location: { kind: 'unresolved' } } as ConversationMatch
 }
 
-function call(
+/** A `tool/call` event: `name` plus object arguments serialized like the model wrote them. */
+function toolCall(
   seq: number,
   callId: string,
-  view: ToolResultNode['callView'],
+  name: string,
+  args: Record<string, unknown>,
   turn = 1,
-): ConversationEventInput {
-  return at(
-    seq,
-    'tool/call',
-    { turn, step: 1, callId, name: 'fixture', argsRaw: '{}' },
-    { for: 'call', view: view ?? { card: 'generic', title: 'fixture' } },
-  )
+): SessionEvent {
+  return at(seq, 'tool/call', {
+    turn, step: 1, callId, name, arguments: JSON.stringify(args),
+  })
 }
 
-function result(
+/** A settled `tool/result` event carrying optional tool-private `meta` (applied diffs). */
+function toolResult(
   seq: number,
   callId: string,
   isError = false,
+  meta?: unknown,
   turn = 1,
-  view?: NonNullable<ToolResultNode['resultView']>,
-): ConversationEventInput {
+): SessionEvent {
   return at(seq, 'tool/result', {
-    turn,
-    step: 1,
+    turn, step: 1,
     message: {
-      source: { type: 'tool-result', callId },
-      content: [{ type: 'tool-result', content: [], isError }],
+      source: { kind: 'tool', callId },
+      content: [{ type: 'tool-result', toolCallId: callId, content: [], isError }],
     },
-  }, view === undefined ? undefined : { for: 'result', view })
+    ...(meta === undefined ? {} : { meta }),
+  })
 }
 
-function diff(...paths: string[]): ToolResultNode['callView'] {
-  return {
-    card: 'diff', title: `Write ${paths[0] ?? ''}`,
-    diffs: paths.map(path => ({ path, oldText: null, newText: 'x' })),
-    locations: paths.map(path => ({ path })),
-  }
-}
-
-function edit(path: string): ToolResultNode['callView'] {
-  return { card: 'generic', title: `insert ${path}`, kind: 'edit', locations: [{ path }] }
-}
-
-function appliedDiff(
+/** Applied-diff result metadata (`meta.diffs`) as the fs tool records it. */
+function appliedMeta(
   ...diffs: ReadonlyArray<readonly [
     path: string, oldText: string | null, newText: string, oldStart?: number, newStart?: number,
   ]>
-): NonNullable<ToolResultNode['resultView']> {
+): unknown {
   return {
-    card: 'diff',
     diffs: diffs.map(([path, oldText, newText, oldStart, newStart]) => ({
       path,
       oldText,
@@ -161,8 +144,8 @@ function appliedDiff(
 }
 
 /** Drive the package definition directly through the public definition callbacks. */
-function fold(entries: readonly ConversationEventInput[]): Readonly<DeliverablesTurnData> | undefined {
-  const [first, ...updates] = entries
+function fold(events: readonly SessionEvent[]): Readonly<DeliverablesTurnData> | undefined {
+  const [first, ...updates] = events
   if (first === undefined) return undefined
   const start = matched(first, 'start')
   const base = {
@@ -171,13 +154,13 @@ function fold(entries: readonly ConversationEventInput[]): Readonly<Deliverables
   } as Parameters<typeof deliverablesDefinition.start>[0]
   const reader: Parameters<typeof deliverablesDefinition.start>[2] = { previous: () => undefined }
   let state = deliverablesDefinition.start(base, start, reader)
-  for (const input of updates) {
-    const candidate = deliverablesDefinition.match(input.event)
+  for (const event of updates) {
+    const candidate = deliverablesDefinition.match(event)
     if (candidate === null || candidate.role !== 'update') continue
-    const match = matched(input, candidate.role)
-    state = deliverablesDefinition.update({ ...base, state }, match, reader)
+    const match = matched(event, candidate.role)
+    state = deliverablesDefinition.update({ ...base, state }, match)
   }
-  const location = deliverablesDefinition.buildLocationData({ ...base, state }, 'turn')
+  const location = deliverablesDefinition.buildLocationData({ ...base, state }, 'turn', null)
   return location?.kind === 'turn' ? location.value as DeliverablesTurnData : undefined
 }
 
@@ -209,74 +192,61 @@ describe('produced-file Turn data', () => {
     expect(selectProducedFiles(tailOwner(undefined, 9, () => {}, 2))).toBeNull()
   })
 
-  it('folds successful diff and generic-edit calls while ignoring reads, failures, and missing locations', () => {
+  it('folds successful write and edit calls while ignoring reads, failures, and non-mutations', () => {
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      call(2, 'write', diff('out/index.html', 'out/app.css')),
-      result(3, 'write', false, 1, appliedDiff(
-        ['out/index.html', 'old html', 'new html'],
-        ['out/app.css', 'old css', 'new css'],
-      )),
-      call(4, 'edit', edit('notes.md')),
-      result(5, 'edit'),
-      call(6, 'read', { card: 'generic', title: 'Read', locations: [{ path: 'input.txt' }] }),
-      result(7, 'read'),
-      call(8, 'failed', diff('broken.txt')),
-      result(9, 'failed', true),
-      call(10, 'locationless', { card: 'diff', title: 'Write', diffs: [] }),
-      result(11, 'locationless'),
+      toolCall(2, 'w1', 'write', { file_path: 'out/index.html', content: 'old html' }),
+      toolCall(3, 'w2', 'write', { file_path: 'out/app.css', content: 'old css' }),
+      toolResult(4, 'w1', false, appliedMeta(['out/index.html', 'old html', 'new html'])),
+      toolResult(5, 'w2', false, appliedMeta(['out/app.css', 'old css', 'new css'])),
+      toolCall(6, 'e1', 'edit', { file_path: 'notes.md', old_string: 'a', new_string: 'b' }),
+      toolResult(7, 'e1'),
+      toolCall(8, 'r1', 'read', { path: 'input.txt' }),
+      toolResult(9, 'r1'),
+      toolCall(10, 'f1', 'write', { file_path: 'broken.txt', content: 'x' }),
+      toolResult(11, 'f1', true),
+      toolCall(12, 'v1', 'str_replace_editor', { command: 'view', path: 'notes.md' }),
+      toolResult(13, 'v1'),
     ])
 
     expect(producedForClosing(value)).toEqual([
       'out/index.html', 'out/app.css', 'notes.md',
     ])
     expect(reviewsForClosing(value)).toEqual([
-      fileReview('out/index.html', [{ path: 'out/index.html', oldText: 'old html', newText: 'new html' }], ['fixture']),
-      fileReview('out/app.css', [{ path: 'out/app.css', oldText: 'old css', newText: 'new css' }], ['fixture']),
-      fileReview('notes.md', [], ['fixture']),
+      fileReview('out/index.html', [{ path: 'out/index.html', oldText: 'old html', newText: 'new html' }], ['write']),
+      fileReview('out/app.css', [{ path: 'out/app.css', oldText: 'old css', newText: 'new css' }], ['write']),
+      fileReview('notes.md', [{ path: 'notes.md', oldText: 'a', newText: 'b' }], ['edit']),
     ])
   })
 
-  it('appends same-file hunks in settlement order and uses call intent only without a result view', () => {
+  it('appends same-file hunks in settlement order and uses call intent when no result meta exists', () => {
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      call(2, 'first', diff('same.txt')),
-      result(3, 'first'),
-      call(4, 'second', diff('same.txt')),
-      result(5, 'second', false, 1, appliedDiff(['same.txt', 'middle', 'after', 12, 12])),
-      call(6, 'malformed', diff('broken.txt')),
-      result(7, 'malformed', false, 1, {
-        card: 'diff', diffs: [{ path: 'broken.txt', oldText: 'a', newText: 'b', oldStart: 0 }],
-      } as never),
+      toolCall(2, 'first', 'edit', { file_path: 'same.txt', old_string: 'x', new_string: 'y' }),
+      toolResult(3, 'first'),
+      toolCall(4, 'second', 'edit', { file_path: 'same.txt', old_string: 'middle', new_string: 'after' }),
+      toolResult(5, 'second', false, appliedMeta(['same.txt', 'middle', 'after', 12, 12])),
+      toolCall(6, 'intent', 'edit', { file_path: 'broken.txt', old_string: 'a', new_string: 'b' }),
+      toolResult(7, 'intent', false, { diffs: 'not-an-array' }),
     ])
 
     expect(reviewsForClosing(value)).toEqual([
       fileReview('same.txt', [
-        { path: 'same.txt', oldText: null, newText: 'x' },
+        { path: 'same.txt', oldText: 'x', newText: 'y' },
         { path: 'same.txt', oldText: 'middle', newText: 'after', oldStart: 12, newStart: 12 },
-      ], ['fixture']),
-      // The malformed result view falls back to the call view's hunks.
-      fileReview('broken.txt', [{ path: 'broken.txt', oldText: null, newText: 'x' }], ['fixture']),
+      ], ['edit']),
+      // Invalid result metadata falls back to the call intent's hunk.
+      fileReview('broken.txt', [{ path: 'broken.txt', oldText: 'a', newText: 'b' }], ['edit']),
     ])
   })
 
   it('reconstructs insert diffs from str_replace_editor call arguments', () => {
-    const insertCall = at(2, 'tool/call', {
-      turn: 1, step: 1, callId: 'ins', name: 'str_replace_editor',
-      argsRaw: JSON.stringify({
-        command: 'insert', path: 'src/app.ts', insert_line: 3, new_str: 'const x = 1;\n',
-      }),
-    }, {
-      for: 'call',
-      view: {
-        card: 'generic', title: 'insert src/app.ts', kind: 'edit',
-        locations: [{ path: 'src/app.ts' }],
-      },
-    })
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      insertCall,
-      result(3, 'ins'),
+      toolCall(2, 'ins', 'str_replace_editor', {
+        command: 'insert', path: 'src/app.ts', insert_line: 3, new_str: 'const x = 1;\n',
+      }),
+      toolResult(3, 'ins'),
     ])
 
     expect(producedForClosing(value)).toEqual(['src/app.ts'])
@@ -288,79 +258,51 @@ describe('produced-file Turn data', () => {
   })
 
   it('labels produced files with the tool commands that touched them', () => {
-    const createCall = at(2, 'tool/call', {
-      turn: 1, step: 1, callId: 'create', name: 'str_replace_editor',
-      argsRaw: JSON.stringify({ command: 'create', path: 'src/app.ts', file_text: 'a\n' }),
-    }, { for: 'call', view: diff('src/app.ts') })
-    const insertCall = at(3, 'tool/call', {
-      turn: 1, step: 1, callId: 'ins', name: 'str_replace_editor',
-      argsRaw: JSON.stringify({ command: 'insert', path: 'src/app.ts', insert_line: 1, new_str: 'x\n' }),
-    }, {
-      for: 'call',
-      view: { card: 'generic', title: 'insert src/app.ts', kind: 'edit', locations: [{ path: 'src/app.ts' }] },
-    })
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      createCall,
-      result(4, 'create'),
-      insertCall,
-      result(5, 'ins'),
+      toolCall(2, 'create', 'str_replace_editor', {
+        command: 'create', path: 'src/app.ts', file_text: 'a\n',
+      }),
+      toolResult(3, 'create'),
+      toolCall(4, 'ins', 'str_replace_editor', {
+        command: 'insert', path: 'src/app.ts', insert_line: 1, new_str: 'x\n',
+      }),
+      toolResult(5, 'ins'),
     ])
     const reviews = reviewsForClosing(value)
     expect(reviews).toHaveLength(1)
     expect(reviews[0]?.sources).toEqual(['create', 'insert'])
   })
 
-  it('ignores non-insert str_replace_editor calls and malformed insert arguments', () => {
-    const viewCall = at(2, 'tool/call', {
-      turn: 1, step: 1, callId: 'view', name: 'str_replace_editor',
-      argsRaw: JSON.stringify({ command: 'view', path: 'src/app.ts' }),
-    }, {
-      for: 'call',
-      view: { card: 'generic', title: 'view src/app.ts', kind: 'read', locations: [{ path: 'src/app.ts' }] },
-    })
-    const malformed = at(3, 'tool/call', {
-      turn: 1, step: 1, callId: 'bad', name: 'str_replace_editor',
-      argsRaw: '{not json',
-    }, {
-      for: 'call',
-      view: { card: 'generic', title: 'insert src/app.ts', kind: 'edit', locations: [{ path: 'src/app.ts' }] },
-    })
+  it('ignores non-mutating str_replace_editor commands and malformed mutation arguments', () => {
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      viewCall,
-      result(4, 'view'),
-      malformed,
-      result(5, 'bad'),
+      toolCall(2, 'view', 'str_replace_editor', { command: 'view', path: 'src/app.ts' }),
+      toolResult(3, 'view'),
+      toolCall(4, 'missing', 'str_replace_editor', { command: 'insert', path: 'src/app.ts', insert_line: 1 }),
+      toolResult(5, 'missing'),
+      toolCall(6, 'empty', 'str_replace_editor', { command: 'insert', path: 'src/app.ts', insert_line: 1, new_str: '' }),
+      toolResult(7, 'empty'),
     ])
-    // A `view` reads nothing; a malformed `insert` still lists its path but
-    // carries no reconstructable hunk.
-    expect(producedForClosing(value)).toEqual(['src/app.ts'])
-    expect(reviewsForClosing(value)).toEqual([fileReview('src/app.ts')])
+    // A `view` reads nothing; an insert without usable new text carries no hunk.
+    expect(producedForClosing(value)).toEqual([])
+    expect(reviewsForClosing(value)).toEqual([])
   })
 
-  it('ignores calls without mutation locations, orphan results, and replacement results', () => {
-    const replacement = result(8, 'replacement')
+  it('ignores non-mutation calls, orphan results, and replacement results', () => {
+    const replacement = toolResult(8, 'replacement')
+    const replacedEvent = {
+      ...replacement,
+      surfaceOp: { op: 'replace', start: 1, end: 1 },
+    } as unknown as SessionEvent
     const value = fold([
       at(1, 'turn/start', { turn: 1 }),
-      at(2, 'tool/call', { turn: 1, step: 1, callId: 'no-view', name: 'fixture', argsRaw: '{}' }),
-      result(3, 'no-view'),
-      call(4, 'locationless-edit', { card: 'generic', title: 'Edit', kind: 'edit' }),
-      result(5, 'locationless-edit'),
-      result(6, 'orphan'),
-      call(7, 'replacement', diff('replaced.txt')),
-      {
-        ...replacement,
-        event: {
-          ...replacement.event,
-          surfaceOp: { op: 'replace', start: 1, end: 1 },
-        } as ConversationEventInput['event'],
-      },
-      call(9, 'malformed-locations', {
-        card: 'diff', title: 'Write', diffs: [], locations: [null, { path: 4 }],
-      } as never),
-      result(10, 'malformed-locations'),
-      at(11, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+      toolCall(2, 'read', 'read', { path: 'input.txt' }),
+      toolResult(3, 'read'),
+      toolResult(4, 'orphan'),
+      toolCall(5, 'replacement', 'edit', { file_path: 'replaced.txt', old_string: 'a', new_string: 'b' }),
+      replacedEvent,
+      at(6, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
     ])
 
     expect(producedForClosing(value)).toEqual([])
@@ -1225,37 +1167,23 @@ describe('plugin registration', () => {
     const registerLocale = vi.fn(() => () => {})
     const disposeRemote = vi.fn(async () => {})
     const mountRemote = vi.fn(async () => disposeRemote)
-    class RemoteFixture extends Service {
-      constructor(scoped: Context) { super(scoped, 'remote') }
+    const fileReview = {
+      status: vi.fn(async () => ({ ok: true as const, value: { files: [] as const } })),
+      apply: vi.fn(async () => ({ ok: true as const, value: { files: [] as const } })),
     }
-    class FileReviewRemoteFixture extends Service {
-      constructor(scoped: Context) { super(scoped, 'remote.fileReview') }
-      async status(): Promise<{ ok: true; value: { files: readonly [] } }> {
-        return { ok: true, value: { files: [] } }
-      }
-      async apply(): Promise<{ ok: true; value: { files: readonly [] } }> {
-        return { ok: true, value: { files: [] } }
-      }
-    }
-    const cordis = new Context()
-    const remoteFixture = cordis.plugin({ apply: scoped => { new RemoteFixture(scoped) } })
-    const fileReviewFixture = cordis.plugin({
-      apply: scoped => { new FileReviewRemoteFixture(scoped) },
-    })
-    await Promise.all([remoteFixture, fileReviewFixture])
-    // Match SessionRuntime: its Agent-scope fiber knows the root Remote service,
-    // but not feature namespaces mounted after the runtime started.
-    const sessionScope = cordis.plugin({ inject: ['remote'], apply: () => {} })
-    await sessionScope
     const ctx = {
       remote: { $mount: mountRemote },
       sessions: {
-        scope: vi.fn(() => sessionScope.ctx),
+        scope: vi.fn(() => ({
+          get: (key: string) => key === 'remote.fileReview' ? fileReview : undefined,
+        })),
         list: { getSnapshot: () => ({ byId: {
           'session-1': { cwd: '/workspace/project' },
         } }) },
       },
-      conversationEvents: { register: (value: unknown) => { definition = value; return () => {} } },
+      uiConversation: {
+        events: { register: (value: unknown) => { definition = value; return () => {} } },
+      },
       effect: (setup: () => void) => { setup() },
       locale: { register: registerLocale, bind: () => makeTranslate(en) },
       slots: {
@@ -1274,7 +1202,7 @@ describe('plugin registration', () => {
     }
 
     const dispose = await apply(ctx as never)
-    expect(inject).toEqual(['slots', 'locale', 'conversationEvents', 'remote', 'sessions'])
+    expect(inject).toEqual(['slots', 'locale', 'uiConversation', 'remote', 'sessions'])
     expect(mountRemote).toHaveBeenCalledOnce()
     expect(definition).toBe(deliverablesDefinition)
     expect(registerLocale).toHaveBeenCalledWith('file-review', { zh, en })
@@ -1310,8 +1238,5 @@ describe('plugin registration', () => {
     expect(service?.forClosing(tailOwner(undefined, 2))).toBeUndefined()
     await dispose()
     expect(disposeRemote).toHaveBeenCalledOnce()
-    await sessionScope.dispose()
-    await fileReviewFixture.dispose()
-    await remoteFixture.dispose()
   })
 })

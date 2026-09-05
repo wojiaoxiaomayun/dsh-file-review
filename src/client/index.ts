@@ -7,9 +7,12 @@
  * composing this plugin out of cordis.yml removes both surfaces entirely;
  * the owning view renders an empty chain and inert prose at zero cost.
  */
-import type { ClientContext, ISessions } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ChatFileMentions } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { Context } from '@deepseek-ai/cordis'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { ChatFileMentions } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { FileReviewRequest, FileReviewResult } from '../change-types.ts'
 import { TYPERT_REMOTE } from '../remote.ts'
@@ -30,7 +33,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export const inject = [
   'slots',
   'locale',
-  'conversationEvents',
+  'uiConversation',
   'remote',
   'sessions',
 ]
@@ -44,13 +47,13 @@ interface FileReviewRemote {
  * Client plugin body: register the dictionaries and the turn-tail entry.
  * @param ctx - client root context.
  */
-export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
+export async function apply(ctx: Context): Promise<() => Promise<void>> {
   const disposeRemote = await ctx.remote.$mount(TYPERT_REMOTE)
   // The package ships Host and browser halves in one TypeScript program. The Host
   // SessionStore and browser ISessions intentionally share the Cordis key, so keep
   // this platform-specific narrowing at the browser entry boundary.
   const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
-  ctx.conversationEvents.register(deliverablesDefinition)
+  ctx.uiConversation.events.register(deliverablesDefinition)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'file-review: dictionaries')
   ctx.slots.inject(
     'conversation.chat.turnTail',
@@ -59,15 +62,17 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
       select: selectProducedFiles,
       locale: NS,
       inject: (sessionId) => {
-        const projectRoot = sessions.list.getSnapshot().byId[sessionId]?.cwd
+        const id = sessionId as SessionId
+        const projectRoot = sessions.list.getSnapshot().byId[id]?.cwd
         const invoke = async (
           method: 'status' | 'apply',
           request: FileReviewRequest,
         ): Promise<FileReviewResult> => {
-          const scope = sessions.scope(sessionId)
+          const scope = sessions.scope(id)
           if (scope === undefined) throw new Error('Session is unavailable')
           // Session scopes are minted by the client runtime and cannot statically
-          // inject namespaces contributed later by feature plugins. `get()` is the
+          // inject namespaces contributed later by feature plugins (the `fileReview`
+          // namespace is mounted dynamically by `ctx.remote.$mount`). `get()` is the
           // Cordis escape hatch for an explicitly mounted dynamic service; tracing
           // still binds the Remote call to this Session scope.
           const fileReview = scope.get('remote.fileReview') as FileReviewRemote | undefined
