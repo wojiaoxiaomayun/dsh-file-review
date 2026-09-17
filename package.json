@@ -78,7 +78,8 @@
     "build:types": "tsc --emitDeclarationOnly --outDir lib/types",
     "build": "npm run build:types && tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && vitest run && npm run test:pack",
+    "test": "npm run build && vitest run && npm run test:typert && npm run test:pack",
+    "test:typert": "node scripts/check-typert-manifest.mjs",
     "test:pack": "node scripts/verify-pack.mjs",
     "prepack": "npm run typecheck && npm test"
   },

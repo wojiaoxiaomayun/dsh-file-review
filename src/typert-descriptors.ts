@@ -1,7 +1,7 @@
 /** Strict Typert codecs shared by the Host and browser contribution artifacts. */
 
 import { z } from 'zod'
-import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
+import type { InvocationDescriptor, TypertCodec, TypertSchema } from '@deepseek-ai/dsh-typert-protocol'
 
 export const PACKAGE_NAME = '@dsh-xhl/dsh-file-review'
 
@@ -27,22 +27,37 @@ const resultSchema = z.object({
   })),
 })
 
-const agentCodec = {
-  mode: 'strict' as const,
-  typeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
-  schema: z.intersection(z.string(), z.unknown()),
+/**
+ * dsh <= 0.1.5-rc.2 validates a strict codec through `schema` (a zod v4
+ * instance), while dsh >= 0.1.6-alpha.1 validates the lazy `create()` factory
+ * instead. Both are carried so one published artifact loads on either line.
+ */
+type StrictCodec = Extract<TypertCodec, { mode: 'strict' }> & {
+  readonly schema: TypertSchema
+  readonly create: () => TypertSchema
 }
 
-const requestCodec = {
-  mode: 'strict' as const,
+const agentSchema = z.intersection(z.string(), z.unknown())
+
+const agentCodec: StrictCodec = {
+  mode: 'strict',
+  typeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
+  schema: agentSchema,
+  create: () => agentSchema,
+}
+
+const requestCodec: StrictCodec = {
+  mode: 'strict',
   typeSymbol: `${PACKAGE_NAME}#FileReviewRequest`,
   schema: requestSchema,
+  create: () => requestSchema,
 }
 
-const resultCodec = {
-  mode: 'strict' as const,
+const resultCodec: StrictCodec = {
+  mode: 'strict',
   typeSymbol: `${PACKAGE_NAME}#FileReviewResult`,
   schema: resultSchema,
+  create: () => resultSchema,
 }
 
 function descriptor(method: 'status' | 'apply'): InvocationDescriptor {
